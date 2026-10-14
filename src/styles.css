@@ -1595,6 +1595,7 @@ button.spinning svg {
 
 /* M3 Outlined Text Field */
 .modal-field input,
+.modal-field select,
 .modal-field textarea {
   width: 100%;
   padding: 9px 12px;
@@ -1614,7 +1615,13 @@ button.spinning svg {
   line-height: 1.5;
 }
 
+.modal-field select option {
+  background: var(--md-surface-high);
+  color: var(--md-on-surface);
+}
+
 .modal-field input:focus,
+.modal-field select:focus,
 .modal-field textarea:focus {
   border-color: var(--md-primary);
   border-width: 2px;
@@ -2666,4 +2673,77 @@ button:focus-visible,
   outline: 3px solid var(--accent, #a89cf7);
   outline-offset: 2px;
   border-radius: 8px;
+}
+
+.share-qr-modal { max-width: 380px; }
+
+.share-qr-box {
+  position: relative;
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.share-qr-code {
+  display: flex;
+  justify-content: center;
+  transition: filter var(--tr);
+}
+
+.share-qr-code svg {
+  display: block;
+  border-radius: var(--s-xs);
+  shape-rendering: crispEdges;
+}
+
+.share-qr-box.concealed .share-qr-code { filter: blur(14px); }
+
+.share-qr-reveal {
+  position: absolute;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+}
+
+.share-qr-reveal-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: var(--s-full);
+  background: var(--md-surface-high);
+  color: var(--md-on-surface);
+  font-size: 13px;
+  font-family: var(--f);
+  box-shadow: var(--elev-3);
+}
+
+.share-qr-reveal svg { width: 18px; height: 18px; }
+
+.share-qr-box.concealed .share-qr-reveal { display: flex; }
+
+.share-qr-error {
+  display: block;
+  padding: 24px 8px;
+  text-align: center;
+  color: var(--danger);
+  font-size: 13px;
+}
+
+.share-qr-warning {
+  margin-top: 12px;
+  text-align: center;
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.share-qr-hint {
+  margin-top: 4px;
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: 12px;
 }

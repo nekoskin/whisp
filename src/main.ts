@@ -4,6 +4,7 @@ import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { readTextFile } from "@tauri-apps/plugin-fs";
 import { scan as qrScan, Format as QrFormat, checkPermissions as qrCheckPermissions, requestPermissions as qrRequestPermissions } from "@tauri-apps/plugin-barcode-scanner";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
+import { renderSVG as renderQrSvg } from "uqr";
 import "./styles.css";
 
 const ICONS = {
@@ -95,6 +96,9 @@ const i18n: Record<Lang, Record<string, string>> = {
     noProfiles: "Нет сохранённых профилей", addProfile: "Добавить ключ",
     keysSection: "Ключи", noKeys: "Нет сохранённых ключей и подписок",
     pasteFromClipboard: "Вставить из буфера обмена", scanQr: "Сканировать QR-код", qrScanFailed: "Не удалось отсканировать QR-код", pasteJson: "Импорт JSON из файла", copyJson: "Копировать JSON",
+    shareQr: "Поделиться QR-кодом", shareQrHint: "На другом устройстве: «+» → «Сканировать QR-код»", shareQrReveal: "Нажмите, чтобы показать",
+    shareQrWarning: "Кто увидит этот код, получит доступ к вашему ключу", shareQrTooLong: "Превышена допустимая длина QR-кода. Используйте «Копировать»",
+    nothingToShare: "Нет ключей и подписок, чтобы поделиться", shareKindKey: "Ключ", shareKindSub: "Подписка", close: "Закрыть",
     jsonData: "JSON", jsonParseError: "Некорректный JSON", jsonImported: "Импортировано записей:", jsonCopied: "JSON скопирован в буфер обмена",
     clipboardEmpty: "Буфер обмена пуст", clipboardReadFailed: "Не удалось прочитать буфер обмена", clipboardWriteFailed: "Не удалось скопировать в буфер обмена",
     pasteUnrecognized: "Не удалось распознать содержимое. Ожидается whispera:// ключ или https:// ссылка",
@@ -283,6 +287,9 @@ const i18n: Record<Lang, Record<string, string>> = {
     noProfiles: "No saved profiles", addProfile: "Add key",
     keysSection: "Keys", noKeys: "No saved keys or subscriptions",
     pasteFromClipboard: "Paste from clipboard", scanQr: "Scan QR code", qrScanFailed: "Failed to scan QR code", pasteJson: "Import JSON file", copyJson: "Copy JSON",
+    shareQr: "Share via QR code", shareQrHint: "On the other device: + → Scan QR code", shareQrReveal: "Tap to reveal",
+    shareQrWarning: "Anyone who sees this code gets access to your key", shareQrTooLong: "Exceeds the maximum QR code length. Use Copy",
+    nothingToShare: "No keys or subscriptions to share", shareKindKey: "Key", shareKindSub: "Subscription", close: "Close",
     jsonData: "JSON", jsonParseError: "Invalid JSON", jsonImported: "Imported entries:", jsonCopied: "JSON copied to clipboard",
     clipboardEmpty: "Clipboard is empty", clipboardReadFailed: "Failed to read clipboard", clipboardWriteFailed: "Failed to copy to clipboard",
     pasteUnrecognized: "Could not recognize the content. Expected a whispera:// key or an https:// link",
@@ -471,6 +478,9 @@ const i18n: Record<Lang, Record<string, string>> = {
     noProfiles: "无保存配置", addProfile: "添加密钥",
     keysSection: "密钥", noKeys: "没有已保存的密钥或订阅",
     pasteFromClipboard: "从剪贴板粘贴", scanQr: "扫描二维码", qrScanFailed: "二维码扫描失败", pasteJson: "从文件导入 JSON", copyJson: "复制 JSON",
+    shareQr: "通过二维码分享", shareQrHint: "在另一台设备上：+ → 扫描二维码", shareQrReveal: "点击显示",
+    shareQrWarning: "看到此二维码的人即可使用您的密钥", shareQrTooLong: "超出二维码最大长度，请使用“复制”",
+    nothingToShare: "没有可分享的密钥或订阅", shareKindKey: "密钥", shareKindSub: "订阅", close: "关闭",
     jsonData: "JSON", jsonParseError: "JSON 格式无效", jsonImported: "已导入条目：", jsonCopied: "JSON 已复制到剪贴板",
     clipboardEmpty: "剪贴板为空", clipboardReadFailed: "读取剪贴板失败", clipboardWriteFailed: "复制到剪贴板失败",
     pasteUnrecognized: "无法识别内容。需要 whispera:// 密钥或 https:// 链接",
@@ -659,6 +669,9 @@ const i18n: Record<Lang, Record<string, string>> = {
     noProfiles: "پروفایلی ذخیره نشده", addProfile: "افزودن کلید",
     keysSection: "کلیدها", noKeys: "کلید یا اشتراکی ذخیره نشده",
     pasteFromClipboard: "جای‌گذاری از کلیپ‌بورد", scanQr: "اسکن کد QR", qrScanFailed: "اسکن کد QR ناموفق بود", pasteJson: "وارد کردن JSON از فایل", copyJson: "کپی JSON",
+    shareQr: "اشتراک‌گذاری با کد QR", shareQrHint: "در دستگاه دیگر: + ← اسکن کد QR", shareQrReveal: "برای نمایش ضربه بزنید",
+    shareQrWarning: "هر کسی این کد را ببیند به کلید شما دسترسی پیدا می‌کند", shareQrTooLong: "از حداکثر طول کد QR بیشتر است. از «کپی» استفاده کنید",
+    nothingToShare: "کلید یا اشتراکی برای اشتراک‌گذاری وجود ندارد", shareKindKey: "کلید", shareKindSub: "اشتراک", close: "بستن",
     jsonData: "JSON", jsonParseError: "JSON نامعتبر", jsonImported: "موارد وارد شده:", jsonCopied: "JSON در کلیپ‌بورد کپی شد",
     clipboardEmpty: "کلیپ‌بورد خالی است", clipboardReadFailed: "خواندن کلیپ‌بورد ناموفق بود", clipboardWriteFailed: "کپی در کلیپ‌بورد ناموفق بود",
     pasteUnrecognized: "محتوا شناسایی نشد. کلید whispera:// یا لینک https:// مورد نیاز است",
@@ -1448,6 +1461,7 @@ function renderHome(): string {
           ${isAndroid ? `<button class="km-item" id="btn-add-key-qr">${ICONS.qr}<span>${t("scanQr")}</span></button>` : ""}
           <button class="km-item" id="btn-add-key-import-json">${ICONS.code}<span>${t("pasteJson")}</span></button>
           <button class="km-item" id="btn-add-key-export-json">${ICONS.copy}<span>${t("copyJson")}</span></button>
+          <button class="km-item" id="btn-share-qr">${ICONS.qr}<span>${t("shareQr")}</span></button>
           <button class="km-item" id="btn-refresh-all-subs">${ICONS.refresh}<span>${t("refreshAllSubs")}</span></button>
           <button class="km-item" id="btn-toggle-sub-auto">${ICONS.bolt}<span>${settings.sub_auto_update ? t("subAutoUpdateOn") : t("subAutoUpdateOff")}</span></button>
         </div>
@@ -1653,6 +1667,11 @@ function bindProfileEvents(): void {
     } catch {
       showToast(t("clipboardWriteFailed"), "error", 2500);
     }
+  });
+  document.getElementById("btn-share-qr")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    document.querySelectorAll<HTMLElement>(".key-menu").forEach(m => { m.hidden = true; });
+    showShareQrModal();
   });
   document.getElementById("btn-refresh-all-subs")?.addEventListener("click", async (e) => {
     e.stopPropagation();
@@ -2804,6 +2823,99 @@ function showProfileModal(prefillKey?: string): void {
   });
 }
 
+const SHARE_QR_ECC = "L";
+const SHARE_QR_QUIET_ZONE = 4;
+const SHARE_QR_LIGHT = "#ffffff";
+const SHARE_QR_DARK = "#000000";
+const SHARE_QR_MAX_WIDTH = 320;
+
+interface ShareItem { label: string; payload: string; }
+
+function shareItems(): ShareItem[] {
+  return [
+    ...profiles.map(p => ({ label: `${t("shareKindKey")}: ${p.name}`, payload: p.key })),
+    ...subscriptions.map(s => ({ label: `${t("shareKindSub")}: ${s.name || s.url}`, payload: s.url })),
+  ];
+}
+
+function activeShareIndex(items: ShareItem[]): number {
+  const sub = subscriptions.find(s => s.keys.includes(settings.conn_key));
+  const wanted = sub ? sub.url : settings.conn_key;
+  return Math.max(0, items.findIndex(i => i.payload === wanted));
+}
+
+function shareQrSvg(payload: string): string | null {
+  try {
+    return renderQrSvg(payload, {
+      ecc: SHARE_QR_ECC,
+      boostEcc: true,
+      border: SHARE_QR_QUIET_ZONE,
+      pixelSize: 1,
+      whiteColor: SHARE_QR_LIGHT,
+      blackColor: SHARE_QR_DARK,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function fitQrToDevicePixels(svg: SVGSVGElement, available: number): void {
+  const modules = svg.viewBox.baseVal.width;
+  const ratio = window.devicePixelRatio || 1;
+  const pixelsPerModule = Math.max(1, Math.floor(available * ratio / modules));
+  const side = `${pixelsPerModule * modules / ratio}px`;
+  svg.style.width = side;
+  svg.style.height = side;
+}
+
+function showShareQrModal(): void {
+  const items = shareItems();
+  if (items.length === 0) { showToast(t("nothingToShare"), "info", 2500); return; }
+  const ov = document.createElement("div");
+  ov.className = "modal-overlay";
+  ov.innerHTML = `<div class="modal share-qr-modal"><h3>${t("shareQr")}</h3>
+    <div class="modal-field"><select id="share-qr-item">${items.map((it, i) => `<option value="${i}">${esc(it.label)}</option>`).join("")}</select></div>
+    <button type="button" class="share-qr-box concealed" id="share-qr-box">
+      <span class="share-qr-code" id="share-qr-code"></span>
+      <span class="share-qr-reveal"><span class="share-qr-reveal-chip">${ICONS.eye}${t("shareQrReveal")}</span></span>
+    </button>
+    <div class="share-qr-warning">${t("shareQrWarning")}</div>
+    <div class="share-qr-hint">${t("shareQrHint")}</div>
+    <div class="modal-actions"><button class="btn-cancel" id="share-qr-copy">${t("copy")}</button><button class="btn-save" id="share-qr-close">${t("close")}</button></div>
+  </div>`;
+  document.body.appendChild(ov);
+  const select = ov.querySelector<HTMLSelectElement>("#share-qr-item")!;
+  const box = ov.querySelector<HTMLButtonElement>("#share-qr-box")!;
+  const code = ov.querySelector<HTMLElement>("#share-qr-code")!;
+  const selected = (): ShareItem => items[Number(select.value)];
+  const draw = (): void => {
+    const svg = shareQrSvg(selected().payload);
+    code.innerHTML = svg ?? `<span class="share-qr-error">${t("shareQrTooLong")}</span>`;
+    const drawn = code.querySelector("svg");
+    if (drawn) fitQrToDevicePixels(drawn, Math.min(box.clientWidth, SHARE_QR_MAX_WIDTH));
+  };
+  const close = (): void => {
+    window.removeEventListener("resize", draw);
+    ov.remove();
+  };
+  select.value = String(activeShareIndex(items));
+  draw();
+  select.addEventListener("change", draw);
+  window.addEventListener("resize", draw);
+  box.addEventListener("click", () => box.classList.remove("concealed"));
+  ov.addEventListener("click", e => { if (e.target === ov) close(); });
+  ov.querySelector("#share-qr-close")?.addEventListener("click", close);
+  ov.querySelector("#share-qr-copy")?.addEventListener("click", async () => {
+    try {
+      await clipboardWrite(selected().payload);
+      showToast(t("copied"), "success", 2000);
+    } catch {
+      showToast(t("clipboardWriteFailed"), "error", 2500);
+    }
+  });
+  select.focus();
+}
+
 function classifyPastedText(text: string): { kind: "key" | "url" | "unknown"; value: string } {
   const trimmed = text.trim();
   if (/^whispera:\/\//i.test(trimmed)) return { kind: "key", value: trimmed };
@@ -2841,7 +2953,9 @@ const DPAD_FOCUSABLE = 'a[href],button:not([disabled]),input:not([disabled]),tex
 const DPAD_NEEDS_TABINDEX = '.bnav-item,.pill-btn,.km-item,label.toggle';
 
 function dpadFocusables(): HTMLElement[] {
-  return Array.from(document.querySelectorAll<HTMLElement>(DPAD_FOCUSABLE))
+  const overlays = document.querySelectorAll<HTMLElement>(".modal-overlay");
+  const scope: ParentNode = overlays.length ? overlays[overlays.length - 1] : document;
+  return Array.from(scope.querySelectorAll<HTMLElement>(DPAD_FOCUSABLE))
     .filter(el => el.offsetParent !== null && el.getClientRects().length > 0 && !el.hasAttribute("disabled"));
 }
 
