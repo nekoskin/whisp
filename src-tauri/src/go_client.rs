@@ -248,13 +248,13 @@ impl GoClientManager {
             self.binary_path.display()
         );
 
-        if self.is_running() {
+        if self.owns_live_tunnel() {
             eprintln!("[go_client] already running — keeping existing tunnel alive");
             return Ok(());
         }
 
         self.stop()?;
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        self.wait_ports_released();
 
         if service_exists(SERVICE_NAME) {
             eprintln!("[go_client] service exists, trying service mode");
@@ -388,6 +388,34 @@ impl GoClientManager {
                 Err(_) => false,
             },
             None => control_reachable(),
+        }
+    }
+
+    fn owns_live_tunnel(&mut self) -> bool {
+        if self.use_service {
+            return service_running(SERVICE_NAME);
+        }
+        match &mut self.process {
+            Some(child) => match child.try_wait() {
+                Ok(Some(status)) => {
+                    note_exit("whispera-go-client", status);
+                    self.process = None;
+                    false
+                }
+                Ok(None) => true,
+                Err(_) => false,
+            },
+            None => false,
+        }
+    }
+
+    fn wait_ports_released(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
+        while std::time::Instant::now() < deadline {
+            if !control_reachable() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 }
