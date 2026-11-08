@@ -216,17 +216,27 @@ jobs:
           fi
           ls -la "$OUT"
 
+      - name: Cache Tauri bundler tools
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.os == 'Windows' && '~\AppData\Local\tauri' || runner.os == 'macOS' && '~/Library/Caches/tauri' || '~/.cache/tauri' }}
+          key: tauri-bundler-${{ matrix.triple }}-${{ hashFiles('package-lock.json') }}
+
       - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
+        shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
           # macOS: только app + tar.gz (DMG bundle_dmg.sh флачит на CI hdiutil).
-          args: --target ${{ matrix.triple }}${{ contains(matrix.triple, 'apple-darwin') && ' --bundles app' || '' }}${{ contains(matrix.triple, 'linux') && ' --bundles deb,rpm,appimage' || '' }}
-          includeDebug: false
-          includeRelease: true
+          TAURI_ARGS: --target ${{ matrix.triple }}${{ contains(matrix.triple, 'apple-darwin') && ' --bundles app' || '' }}${{ contains(matrix.triple, 'linux') && ' --bundles deb,rpm,appimage' || '' }}
+        run: |
+          read -ra args <<< "$TAURI_ARGS"
+          for attempt in 1 2; do
+            npm run tauri build -- "${args[@]}" && exit 0
+            echo "tauri build failed on attempt $attempt; a bundler download can time out, so it runs once more"
+          done
+          exit 1
 
       - name: Pack portable Linux tarball
         if: matrix.label == 'linux-x86_64'
