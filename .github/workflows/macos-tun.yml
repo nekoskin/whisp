@@ -72,7 +72,7 @@ jobs:
           SERVER_DIR="$RUNNER_TEMP/server"
           mkdir -p "$SERVER_DIR"
           sed "s/listen_addr: \":443\"/listen_addr: \":${WHISPERA_PORT}\"/" \
-            whispera/scripts/e2e/cfg/config.yaml > "$SERVER_DIR/config.yaml"
+            whispera/config.yaml > "$SERVER_DIR/config.yaml"
           cd "$SERVER_DIR"
           KEY=$(sudo "$RUNNER_TEMP/$SERVER_PROCESS" create-key -user "$KEY_USER" -port "$WHISPERA_PORT" \
             -sni "$KEY_SNI" -self-cert enable -config config.yaml \
