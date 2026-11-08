@@ -26,7 +26,7 @@
   },
   "productName": "Whisp",
   "mainBinaryName": "Whisp",
-  "version": "0.0.13",
+  "version": "0.0.14",
   "identifier": "com.whispera.whisp",
   "plugins": {},
   "app": {
