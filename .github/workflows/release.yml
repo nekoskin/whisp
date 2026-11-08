@@ -273,6 +273,10 @@ jobs:
       ANDROID_GOMOBILE_TARGETS: android/arm64,android/arm,android/amd64
       ANDROID_TAURI_TARGETS: aarch64 armv7 x86_64
       ANDROID_ABIS: arm64-v8a armeabi-v7a x86_64
+      ANDROID_BUILD_ATTEMPTS: 2
+      GRADLE_NETWORK_TIMEOUT_MS: 120000
+      GRADLE_DOWNLOAD_TENTATIVES: 6
+      GRADLE_DOWNLOAD_BACKOFF_MS: 2000
     steps:
       - uses: actions/checkout@v4
         with:
@@ -327,14 +331,17 @@ jobs:
           workspaces: src-tauri
           key: android
 
-      - name: Cache Gradle
-        uses: actions/cache@v4
+      - name: Restore Gradle cache
+        id: gradle-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('src-tauri/gen/android/**/*.gradle*', 'src-tauri/gen/android/**/gradle-wrapper.properties') }}
-          restore-keys: gradle-${{ runner.os }}-
+          key: gradle-${{ runner.os }}-${{ hashFiles('package-lock.json', 'src-tauri/Cargo.lock', 'src-tauri/android-patch/**') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-${{ hashFiles('package-lock.json', 'src-tauri/Cargo.lock', 'src-tauri/android-patch/**') }}-
+            gradle-${{ runner.os }}-
 
       - name: Install cargo-ndk
         run: cargo install cargo-ndk
@@ -432,10 +439,19 @@ jobs:
       - name: Apply VpnService patch (Kotlin + manifest)
         run: bash src-tauri/android-patch/apply.sh
 
-      - name: Install Gradle init script for singbox.aar
+      - name: Configure Gradle downloads and the singbox.aar init script
         run: |
           mkdir -p ~/.gradle/init.d
           cp src-tauri/android-patch/singbox.gradle ~/.gradle/init.d/singbox.gradle
+          {
+            echo "systemProp.org.gradle.internal.http.connectionTimeout=$GRADLE_NETWORK_TIMEOUT_MS"
+            echo "systemProp.org.gradle.internal.http.socketTimeout=$GRADLE_NETWORK_TIMEOUT_MS"
+            echo "systemProp.org.gradle.internal.repository.max.tentatives=$GRADLE_DOWNLOAD_TENTATIVES"
+            echo "systemProp.org.gradle.internal.repository.initial.backoff=$GRADLE_DOWNLOAD_BACKOFF_MS"
+          } >> ~/.gradle/gradle.properties
+          WRAPPER=src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties
+          sed -i '/^networkTimeout=/d' "$WRAPPER"
+          echo "networkTimeout=$GRADLE_NETWORK_TIMEOUT_MS" >> "$WRAPPER"
 
       - name: Restore stable Android signing keystore
         env:
@@ -455,8 +471,12 @@ jobs:
           export NDK_HOME="$ANDROID_NDK_HOME"
           read -ra targets <<< "$ANDROID_TAURI_TARGETS"
           set +e
-          npx tauri android build --apk --debug --target "${targets[@]}" --verbose > tauri-build.log 2>&1
-          BUILD_EXIT=$?
+          for attempt in $(seq "$ANDROID_BUILD_ATTEMPTS"); do
+            npx tauri android build --apk --debug --target "${targets[@]}" --verbose >> tauri-build.log 2>&1
+            BUILD_EXIT=$?
+            [ "$BUILD_EXIT" -eq 0 ] && break
+            echo "tauri android build failed on attempt $attempt with exit code $BUILD_EXIT" | tee -a tauri-build.log
+          done
           set -e
           echo "exit_code=$BUILD_EXIT" >> $GITHUB_OUTPUT
           exit $BUILD_EXIT
@@ -473,7 +493,11 @@ jobs:
         run: |
           export NDK_HOME="$ANDROID_NDK_HOME"
           read -ra targets <<< "$ANDROID_TAURI_TARGETS"
-          npx tauri android build --apk --debug --split-per-abi --target "${targets[@]}" --verbose >> tauri-build.log 2>&1
+          for attempt in $(seq "$ANDROID_BUILD_ATTEMPTS"); do
+            npx tauri android build --apk --debug --split-per-abi --target "${targets[@]}" --verbose >> tauri-build.log 2>&1 && exit 0
+            echo "tauri android per-ABI build failed on attempt $attempt" | tee -a tauri-build.log
+          done
+          exit 1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -526,6 +550,15 @@ jobs:
           path: apk-out/*.apk
           retention-days: 5
           if-no-files-found: warn
+
+      - name: Save Gradle cache
+        if: always() && steps.gradle-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ steps.gradle-cache.outputs.cache-primary-key }}${{ job.status != 'success' && format('-{0}', github.run_id) || '' }}
 
 # ── GitHub Release ─────────────────────────────────────────────────────────
   release:
