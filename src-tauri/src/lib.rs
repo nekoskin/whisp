@@ -10,6 +10,8 @@ use tauri_plugin_shell::ShellExt;
 
 mod go_client;
 mod mihomo;
+#[cfg(any(windows, test))]
+mod sysproxy;
 #[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
 mod system_dns;
 #[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
@@ -143,6 +145,10 @@ struct AppSettings {
     dns_redirect: bool,
     #[serde(default = "default_true")]
     ipv6: bool,
+    #[serde(default = "default_true")]
+    ipv6_fallback: bool,
+    #[serde(default)]
+    ipv6_only: bool,
     #[serde(default = "default_tun")]
     tun_stack: String,
     #[serde(default = "default_true")]
@@ -191,10 +197,63 @@ struct AppSettings {
     ping_mode: String,
     #[serde(default = "default_tun_android")]
     tun_stack_android: String,
+    #[serde(default = "default_proxy_mode")]
+    proxy_mode: String,
+}
+
+const PROXY_MODE_TUN: &str = "tun";
+const PROXY_MODE_SYSTEM: &str = "system";
+#[cfg(windows)]
+const SYSTEM_PROXY_BACKUP: &str = "system-proxy-backup.json";
+
+#[cfg(target_os = "android")]
+fn server_ipv6_mode(fallback: bool, only: bool) -> &'static str {
+    match (only, fallback) {
+        (true, _) => "only",
+        (false, true) => "auto",
+        (false, false) => "off",
+    }
 }
 
 fn default_true() -> bool {
     true
+}
+fn default_proxy_mode() -> String {
+    PROXY_MODE_TUN.to_string()
+}
+
+fn tun_enabled(settings: &AppSettings) -> bool {
+    !cfg!(windows) || settings.proxy_mode != PROXY_MODE_SYSTEM
+}
+
+#[cfg(windows)]
+fn system_proxy_backup(app: &tauri::AppHandle) -> PathBuf {
+    mihomo_config_path(app).with_file_name(SYSTEM_PROXY_BACKUP)
+}
+
+fn apply_proxy_mode(app: &tauri::AppHandle, settings: &AppSettings) -> Result<(), String> {
+    #[cfg(windows)]
+    if !tun_enabled(settings) {
+        let server = format!("127.0.0.1:{}", settings.mihomo_port);
+        return sysproxy::apply(
+            &sysproxy::InternetOptions,
+            &system_proxy_backup(app),
+            &sysproxy::manual(&server),
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = settings;
+    restore_system_proxy(app);
+    Ok(())
+}
+
+fn restore_system_proxy(app: &tauri::AppHandle) {
+    #[cfg(windows)]
+    if let Err(e) = sysproxy::restore(&sysproxy::InternetOptions, &system_proxy_backup(app)) {
+        eprintln!("[system proxy] {e}");
+    }
+    #[cfg(not(windows))]
+    let _ = app;
 }
 fn default_tun() -> String {
     "Mixed".to_string()
@@ -226,6 +285,8 @@ impl Default for AppSettings {
             kill_switch: false,
             dns_redirect: false,
             ipv6: true,
+            ipv6_fallback: true,
+            ipv6_only: false,
             tun_stack: "Mixed".to_string(),
             hwid: true,
             auth_tip: true,
@@ -250,6 +311,7 @@ impl Default for AppSettings {
             mtu: 1500,
             tls_fragment: false,
             sub_auto_update: true,
+            proxy_mode: default_proxy_mode(),
         }
     }
 }
@@ -257,7 +319,6 @@ impl Default for AppSettings {
 struct AppState {
     mihomo: Mutex<MihomoManager>,
     go_client: Mutex<GoClientManager>,
-    android_proxy: Mutex<Option<String>>,
     external_engine: std::sync::atomic::AtomicBool,
 }
 
@@ -305,10 +366,20 @@ fn save_app_setting(app: tauri::AppHandle, mut settings: AppSettings) -> Result<
             }
         }
     }
+    #[cfg(windows)]
+    let enabling_autostart = settings.auto_connect
+        && !fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<AppSettings>(&raw).ok())
+            .is_some_and(|existing| existing.auto_connect);
     let data = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
     fs::write(&path, data).map_err(|e| e.to_string())?;
     #[cfg(desktop)]
     sync_autostart(&app, settings.auto_connect)?;
+    #[cfg(windows)]
+    if enabling_autostart {
+        install_tunnel_service_in_background(&app);
+    }
     #[cfg(target_os = "android")]
     {
         let enabled = settings.auto_connect;
@@ -316,6 +387,22 @@ fn save_app_setting(app: tauri::AppHandle, mut settings: AppSettings) -> Result<
             .map_err(|_| "panic in set_autostart".to_string())??;
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn install_tunnel_service_in_background(app: &tauri::AppHandle) {
+    let app = app.clone();
+    let config_path = mihomo_config_path(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let state: tauri::State<AppState> = app.state();
+        let installed = match state.mihomo.lock() {
+            Ok(mgr) => mgr.ensure_persistent_service(&config_path),
+            Err(e) => Err(e.to_string()),
+        };
+        if let Err(e) = installed {
+            eprintln!("[autostart] tunnel service: {e}");
+        }
+    });
 }
 
 #[cfg(desktop)]
@@ -347,25 +434,6 @@ fn ensure_controller_secret(app: &tauri::AppHandle) -> Result<(), String> {
     settings.secret = raw.iter().map(|b| format!("{b:02x}")).collect();
     let data = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
     fs::write(settings_path(app), data).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn patch_app_settings(app: tauri::AppHandle, patch: serde_json::Value) -> Result<(), String> {
-    let path = settings_path(&app);
-    let mut current: serde_json::Value = if path.exists() {
-        let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        serde_json::from_str(&raw).unwrap_or(serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-    if let (Some(obj), Some(patch_obj)) = (current.as_object_mut(), patch.as_object()) {
-        for (k, v) in patch_obj {
-            obj.insert(k.clone(), v.clone());
-        }
-    }
-    let data = serde_json::to_string_pretty(&current).map_err(|e| e.to_string())?;
-    fs::write(&path, data).map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 async fn wait_go_client_ready(
@@ -423,16 +491,7 @@ async fn connect(
         let auto_connect = settings.auto_connect;
         let tun_stack = settings.tun_stack_android.to_lowercase();
         let quic = settings.quic;
-
-        if !conn_key.is_empty() {
-            use sha2::Digest;
-            let hash = sha2::Sha256::digest(conn_key.as_bytes());
-            let pass: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
-            let proxy_url = format!("socks5h://whisp:{}@127.0.0.1:1080", pass);
-            if let Ok(mut p) = state.android_proxy.lock() {
-                *p = Some(proxy_url);
-            }
-        }
+        let server_ipv6 = server_ipv6_mode(settings.ipv6_fallback, settings.ipv6_only);
 
         let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
             whisp_vpn_android::service_intent::is_vpn_prepared,
@@ -460,6 +519,7 @@ async fn connect(
                     auto_connect,
                     &tun_stack,
                     quic,
+                    server_ipv6,
                 )
             }));
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
@@ -488,6 +548,7 @@ async fn connect(
                     auto_connect,
                     &tun_stack,
                     quic,
+                    server_ipv6,
                 )
             }))
         })
@@ -553,6 +614,8 @@ async fn connect(
                 hwid: settings.hwid,
                 tls_fingerprint: &settings.tls_fingerprint,
                 tls_fragment: settings.tls_fragment,
+                ipv6_fallback: settings.ipv6_fallback,
+                ipv6_only: settings.ipv6_only,
                 split_rules: &build_client_rules_json(&settings),
             })
             .map_err(|e| {
@@ -588,6 +651,7 @@ async fn connect(
         socks_addr: &socks_addr,
         server_host: &server_host_from_key(&settings.conn_key),
         mixed_port: settings.mihomo_port,
+        tun: tun_enabled(&settings),
         tun_stack: &settings.tun_stack,
         dns_redirect: settings.dns_redirect,
         ipv6: settings.ipv6,
@@ -608,7 +672,8 @@ async fn connect(
     fs::write(&config_path, &mihomo_config).map_err(|e| e.to_string())?;
 
     let mut mgr = state.mihomo.lock().map_err(|e| e.to_string())?;
-    mgr.start(&config_path)?;
+    mgr.start(&config_path, tun_enabled(&settings))?;
+    apply_proxy_mode(&app, &settings)?;
 
     Ok(format!(
         "Connected via key (socks5: {}) | mihomo port {}",
@@ -617,12 +682,13 @@ async fn connect(
 }
 
 #[tauri::command]
-async fn disconnect(state: tauri::State<'_, AppState>) -> Result<String, String> {
+async fn disconnect(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
     #[cfg(target_os = "android")]
     {
-        if let Ok(mut p) = state.android_proxy.lock() {
-            *p = None;
-        }
+        let _ = &app;
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
             whisp_vpn_android::service_intent::stop_vpn_service,
         ));
@@ -635,8 +701,9 @@ async fn disconnect(state: tauri::State<'_, AppState>) -> Result<String, String>
 
     #[allow(unreachable_code)]
     {
+        restore_system_proxy(&app);
         let mut mihomo = state.mihomo.lock().map_err(|e| e.to_string())?;
-        mihomo.stop()?;
+        mihomo.stop_tun()?;
 
         let mut gc = state.go_client.lock().map_err(|e| e.to_string())?;
         gc.stop()?;
@@ -685,345 +752,21 @@ fn get_status(state: tauri::State<AppState>) -> Result<bool, String> {
 #[tauri::command]
 fn get_tunnel_state() -> serde_json::Value {
     match go_client::tunnel_state() {
-        Some((up, error)) => serde_json::json!({"known": true, "up": up, "error": error}),
-        None => serde_json::json!({"known": false, "up": false, "error": null}),
+        Some(t) => serde_json::json!({
+            "known": true,
+            "up": t.up,
+            "error": t.error,
+            "failure": t.failure,
+            "connected_at": t.connected_at,
+        }),
+        None => serde_json::json!({
+            "known": false,
+            "up": false,
+            "error": null,
+            "failure": null,
+            "connected_at": null,
+        }),
     }
-}
-
-const CONTROL_PORT_MAIN: u16 = 10801;
-
-fn control_base(port: u16) -> String {
-    format!("http://127.0.0.1:{}", port)
-}
-
-fn conn_url(id: &str, action: &str) -> String {
-    format!(
-        "{}/connections/{}/{}",
-        control_base(control_port_for_id(id)),
-        raw_id(id),
-        action
-    )
-}
-
-fn control_port_for_id(_id: &str) -> u16 {
-    CONTROL_PORT_MAIN
-}
-
-fn raw_id(id: &str) -> &str {
-    id
-}
-
-#[tauri::command]
-async fn get_connections() -> Result<serde_json::Value, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let all: Vec<serde_json::Value> = match client
-        .get(format!("{}/connections", control_base(CONTROL_PORT_MAIN)))
-        .send()
-        .await
-    {
-        Ok(r) => r.json::<Vec<serde_json::Value>>().await.unwrap_or_default(),
-        Err(_) => vec![],
-    };
-
-    Ok(serde_json::Value::Array(all))
-}
-
-#[tauri::command]
-async fn close_connection(id: String) -> Result<bool, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| e.to_string())?;
-    client
-        .post(conn_url(&id, "close"))
-        .send()
-        .await
-        .map_err(|_| "control server unavailable".to_string())?;
-    Ok(true)
-}
-
-#[tauri::command]
-async fn toggle_connection(id: String, enabled: bool) -> Result<bool, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| e.to_string())?;
-    client
-        .post(conn_url(&id, "toggle"))
-        .json(&serde_json::json!({"enabled": enabled}))
-        .send()
-        .await
-        .map_err(|_| "control server unavailable".to_string())?;
-    Ok(true)
-}
-
-#[tauri::command]
-async fn toggle_obfuscation(id: String, enabled: bool) -> Result<bool, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| e.to_string())?;
-    client
-        .post(conn_url(&id, "obfuscation"))
-        .json(&serde_json::json!({"enabled": enabled}))
-        .send()
-        .await
-        .map_err(|_| "control server unavailable".to_string())?;
-    Ok(true)
-}
-
-#[tauri::command]
-async fn switch_transport(id: String, transport: String) -> Result<bool, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
-        .post(conn_url(&id, "transport"))
-        .json(&serde_json::json!({"transport": transport}))
-        .send()
-        .await
-        .map_err(|_| "control server unavailable".to_string())?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "transport switch failed ({}): {}",
-            status.as_u16(),
-            body.trim()
-        ));
-    }
-    Ok(true)
-}
-
-#[tauri::command]
-async fn get_agent_stats() -> Result<serde_json::Value, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
-        .get(format!("{}/agent", control_base(CONTROL_PORT_MAIN)))
-        .send()
-        .await
-        .map_err(|_| "control server unavailable".to_string())?;
-    resp.json::<serde_json::Value>()
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn agent_recommend() -> Result<serde_json::Value, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
-        .get(format!(
-            "{}/agent/recommend",
-            control_base(CONTROL_PORT_MAIN)
-        ))
-        .send()
-        .await
-        .map_err(|_| "control server unavailable".to_string())?;
-    resp.json::<serde_json::Value>()
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn agent_report(
-    transport: String,
-    server: String,
-    success: bool,
-    latency_ms: u64,
-    error: Option<String>,
-) -> Result<bool, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| e.to_string())?;
-    client
-        .post(format!("{}/agent/report", control_base(CONTROL_PORT_MAIN)))
-        .json(&serde_json::json!({
-            "transport": transport,
-            "server": server,
-            "success": success,
-            "latency": latency_ms * 1_000_000,
-            "error": error.unwrap_or_default(),
-        }))
-        .send()
-        .await
-        .map_err(|_| "control server unavailable".to_string())?;
-    Ok(true)
-}
-
-#[tauri::command]
-async fn set_connection_speed(id: String, rate_limit_kb: i64) -> Result<bool, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| e.to_string())?;
-    client
-        .post(conn_url(&id, "speed"))
-        .json(&serde_json::json!({"rate_limit_kb": rate_limit_kb}))
-        .send()
-        .await
-        .map_err(|_| "control server unavailable".to_string())?;
-    Ok(true)
-}
-
-#[tauri::command]
-async fn set_connection_sni(id: String, sni: String) -> Result<bool, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| e.to_string())?;
-    client
-        .post(conn_url(&id, "sni"))
-        .json(&serde_json::json!({"sni": sni}))
-        .send()
-        .await
-        .map_err(|_| "control server unavailable".to_string())?;
-    Ok(true)
-}
-
-#[tauri::command]
-async fn set_connection_bridge(id: String, bridge: String) -> Result<bool, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| e.to_string())?;
-    client
-        .post(conn_url(&id, "bridge"))
-        .json(&serde_json::json!({"bridge": bridge}))
-        .send()
-        .await
-        .map_err(|_| "control server unavailable".to_string())?;
-    Ok(true)
-}
-
-#[tauri::command]
-async fn duplicate_connection(id: String) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
-        .post(conn_url(&id, "duplicate"))
-        .send()
-        .await
-        .map_err(|_| "control server unavailable".to_string())?;
-    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(v["id"].as_str().unwrap_or("").to_string())
-}
-
-#[tauri::command]
-async fn change_connection_port(id: String, port: String) -> Result<bool, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| e.to_string())?;
-    client
-        .post(conn_url(&id, "port"))
-        .json(&serde_json::json!({"port": port}))
-        .send()
-        .await
-        .map_err(|_| "control server unavailable".to_string())?;
-    Ok(true)
-}
-
-#[tauri::command]
-async fn set_connection_mux(id: String, enabled: bool) -> Result<bool, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| e.to_string())?;
-    client
-        .post(conn_url(&id, "mux"))
-        .json(&serde_json::json!({"enabled": enabled}))
-        .send()
-        .await
-        .map_err(|_| "control server unavailable".to_string())?;
-    Ok(true)
-}
-
-#[tauri::command]
-async fn set_transport_secure(id: String, enabled: bool) -> Result<bool, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| e.to_string())?;
-    client
-        .post(conn_url(&id, "transport_secure"))
-        .json(&serde_json::json!({"enabled": enabled}))
-        .send()
-        .await
-        .map_err(|_| "control server unavailable".to_string())?;
-    Ok(true)
-}
-
-#[tauri::command]
-async fn set_behavioral_profile(id: String, profile: String) -> Result<bool, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
-        .post(conn_url(&id, "profile"))
-        .json(&serde_json::json!({"profile": profile}))
-        .send()
-        .await
-        .map_err(|_| "control server unavailable".to_string())?;
-    if !resp.status().is_success() {
-        let msg = resp.text().await.unwrap_or_default();
-        return Err(format!("set_profile failed: {}", msg));
-    }
-    Ok(true)
-}
-
-#[derive(Serialize)]
-struct IpInfoResponse {
-    ip: String,
-    city: String,
-    region: String,
-    country: String,
-    org: String,
-    loc: String,
-}
-
-#[tauri::command]
-async fn get_ip_info(state: tauri::State<'_, AppState>) -> Result<IpInfoResponse, String> {
-    let proxy_url = state.android_proxy.lock().ok().and_then(|g| g.clone());
-
-    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(8));
-    if let Some(ref proxy) = proxy_url {
-        if let Ok(p) = reqwest::Proxy::all(proxy.as_str()) {
-            builder = builder.proxy(p);
-        }
-    }
-    let client = builder.build().map_err(|e| e.to_string())?;
-
-    let resp = client
-        .get("https://ipinfo.io/json")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-
-    Ok(IpInfoResponse {
-        ip: json["ip"].as_str().unwrap_or("—").to_string(),
-        city: json["city"].as_str().unwrap_or("—").to_string(),
-        region: json["region"].as_str().unwrap_or("—").to_string(),
-        country: json["country"].as_str().unwrap_or("—").to_string(),
-        org: json["org"].as_str().unwrap_or("—").to_string(),
-        loc: json["loc"].as_str().unwrap_or("").to_string(),
-    })
 }
 
 #[derive(Serialize)]
@@ -1190,6 +933,12 @@ fn get_routing_rules(app: tauri::AppHandle) -> Result<Vec<RoutingRule>, String> 
     Ok(settings.routing_rules)
 }
 
+fn mihomo_is_idle(app: &tauri::AppHandle) -> bool {
+    let state: tauri::State<AppState> = app.state();
+    let idle = state.mihomo.try_lock().is_ok_and(|m| m.is_idle());
+    idle
+}
+
 #[tauri::command]
 async fn save_routing_rules(app: tauri::AppHandle, rules: Vec<RoutingRule>) -> Result<(), String> {
     let path = settings_path(&app);
@@ -1223,6 +972,7 @@ async fn save_routing_rules(app: tauri::AppHandle, rules: Vec<RoutingRule>) -> R
         socks_addr: &socks_addr,
         server_host: &server_host_from_key(&settings.conn_key),
         mixed_port: settings.mihomo_port,
+        tun: tun_enabled(&settings),
         tun_stack: &settings.tun_stack,
         dns_redirect: settings.dns_redirect,
         ipv6: settings.ipv6,
@@ -1242,6 +992,9 @@ async fn save_routing_rules(app: tauri::AppHandle, rules: Vec<RoutingRule>) -> R
     });
     fs::write(&config_path, &mihomo_config).map_err(|e| e.to_string())?;
 
+    if mihomo_is_idle(&app) {
+        return Ok(());
+    }
     let config_str = config_path.to_string_lossy().replace('\\', "/");
     let _ = reqwest::Client::new()
         .put("http://127.0.0.1:9090/configs?force=true")
@@ -1254,75 +1007,10 @@ async fn save_routing_rules(app: tauri::AppHandle, rules: Vec<RoutingRule>) -> R
     Ok(())
 }
 
-#[tauri::command]
-async fn apply_tls_fingerprint(app: tauri::AppHandle) -> Result<(), String> {
-    if cfg!(target_os = "android") {
-        return Ok(());
-    }
-    let settings = get_app_settings(app.clone())?;
-    let config_path = mihomo_config_path(&app);
-    let socks_addr = if settings.socks_addr.contains(':') {
-        settings.socks_addr.clone()
-    } else {
-        format!("{}:1080", settings.socks_addr)
-    };
-    let mut routing_rules: Vec<mihomo::MihomoRoutingRule> = Vec::new();
-    for r in &settings.blocklist {
-        routing_rules.push(mihomo::MihomoRoutingRule {
-            kind: r.kind.clone(),
-            value: r.value.clone(),
-            action: "REJECT".to_string(),
-        });
-    }
-    for r in &settings.routing_rules {
-        routing_rules.push(mihomo::MihomoRoutingRule {
-            kind: r.kind.clone(),
-            value: r.value.clone(),
-            action: r.action.clone(),
-        });
-    }
-    let mihomo_config = mihomo::generate_config(&mihomo::MihomoConfig {
-        socks_addr: &socks_addr,
-        server_host: &server_host_from_key(&settings.conn_key),
-        mixed_port: settings.mihomo_port,
-        tun_stack: &settings.tun_stack,
-        dns_redirect: settings.dns_redirect,
-        ipv6: settings.ipv6,
-        routing_rules: &routing_rules,
-        extra_socks_addrs: &[],
-        custom_dns: &settings.custom_dns,
-        socks_user: &settings.socks_user,
-        socks_pass: &settings.socks_pass,
-        allow_lan: settings.allow_lan,
-        log_level: &settings.log_level,
-        routing_mode: &settings.routing_mode,
-        bypass_ru: settings.bypass_ru,
-        external_link: &settings.external_link,
-        secret: &settings.secret,
-        kill_switch: settings.kill_switch,
-        vpn_dns: &settings.vpn_dns,
-    });
-    fs::write(&config_path, &mihomo_config).map_err(|e| e.to_string())?;
-
-    let config_str = config_path.to_string_lossy().replace('\\', "/");
-    reqwest::Client::new()
-        .put("http://127.0.0.1:9090/configs?force=true")
-        .bearer_auth(&settings.secret)
-        .json(&serde_json::json!({ "path": config_str }))
-        .timeout(Duration::from_secs(3))
-        .send()
-        .await
-        .map_err(|e| format!("mihomo reload failed: {}", e))?;
-
-    Ok(())
-}
-
 // The go-client process itself writes its logs to this file (-log-file flag
 // in WhispVpnService.launchGoClient). It runs in the app's own UID, so the
 // file is readable from any process of this app — including the main/UI
-// process, which is where this Tauri command runs. This does NOT rely on
-// whisp_vpn_android::LOG_BUFFER, which lives in the :vpn process and is a
-// separate memory space (Rust statics aren't shared across processes).
+// process, which is where this Tauri command runs.
 static GO_CLIENT_LOG_OFFSET: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
 
 fn go_client_log_path() -> Option<std::path::PathBuf> {
@@ -1483,6 +1171,7 @@ async fn save_blocklist(app: tauri::AppHandle, rules: Vec<RoutingRule>) -> Resul
         socks_addr: &socks_addr,
         server_host: &server_host_from_key(&settings.conn_key),
         mixed_port: settings.mihomo_port,
+        tun: tun_enabled(&settings),
         tun_stack: &settings.tun_stack,
         dns_redirect: settings.dns_redirect,
         ipv6: settings.ipv6,
@@ -1502,6 +1191,9 @@ async fn save_blocklist(app: tauri::AppHandle, rules: Vec<RoutingRule>) -> Resul
     });
     fs::write(&config_path, &mihomo_config).map_err(|e| e.to_string())?;
 
+    if mihomo_is_idle(&app) {
+        return Ok(());
+    }
     let config_str = config_path.to_string_lossy().replace('\\', "/");
     let _ = reqwest::Client::new()
         .put("http://127.0.0.1:9090/configs?force=true")
@@ -1512,129 +1204,6 @@ async fn save_blocklist(app: tauri::AppHandle, rules: Vec<RoutingRule>) -> Resul
         .await;
 
     Ok(())
-}
-
-#[tauri::command]
-fn tunnel_service_installed() -> bool {
-    #[cfg(windows)]
-    {
-        return mihomo::MihomoManager::service_installed();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        return tun_helper::is_installed();
-    }
-    #[allow(unreachable_code)]
-    false
-}
-
-#[tauri::command]
-async fn install_tunnel_service(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
-    #[cfg(windows)]
-    {
-        let config_path = mihomo_config_path(&app);
-        let mgr = state.mihomo.lock().map_err(|e| e.to_string())?;
-        mgr.install_persistent_service(&config_path)?;
-        return Ok("Служба установлена: подключение больше не будет запрашивать права".to_string());
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let config_path = mihomo_config_path(&app);
-        let mgr = state.mihomo.lock().map_err(|e| e.to_string())?;
-        mgr.install_tun_helper(&config_path)?;
-        return Ok("Служба установлена: подключение больше не будет запрашивать права".to_string());
-    }
-    #[allow(unreachable_code)]
-    {
-        let _ = (app, state);
-        Err("Служба нужна только на Windows и macOS".to_string())
-    }
-}
-
-#[tauri::command]
-async fn remove_tunnel_service(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    #[cfg(windows)]
-    {
-        let mut mgr = state.mihomo.lock().map_err(|e| e.to_string())?;
-        mgr.remove_persistent_service()?;
-        return Ok("Служба удалена".to_string());
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let mut mgr = state.mihomo.lock().map_err(|e| e.to_string())?;
-        mgr.stop()?;
-        tun_helper::uninstall()?;
-        return Ok("Служба удалена".to_string());
-    }
-    #[allow(unreachable_code)]
-    {
-        let _ = state;
-        Err("Служба нужна только на Windows и macOS".to_string())
-    }
-}
-
-#[tauri::command]
-fn install_services(
-    app: tauri::AppHandle,
-    state: tauri::State<AppState>,
-) -> Result<String, String> {
-    let settings = get_app_settings(app.clone())?;
-    let config_path = mihomo_config_path(&app);
-
-    if !config_path.exists() {
-        let stub = mihomo::generate_config(&mihomo::MihomoConfig {
-            socks_addr: &settings.socks_addr,
-            server_host: &server_host_from_key(&settings.conn_key),
-            mixed_port: settings.mihomo_port,
-            tun_stack: &settings.tun_stack,
-            dns_redirect: settings.dns_redirect,
-            ipv6: settings.ipv6,
-            routing_rules: &[],
-            extra_socks_addrs: &[],
-            custom_dns: &settings.custom_dns,
-            socks_user: &settings.socks_user,
-            socks_pass: &settings.socks_pass,
-            allow_lan: settings.allow_lan,
-            log_level: &settings.log_level,
-            routing_mode: &settings.routing_mode,
-            bypass_ru: settings.bypass_ru,
-            external_link: &settings.external_link,
-            secret: &settings.secret,
-            kill_switch: settings.kill_switch,
-            vpn_dns: &settings.vpn_dns,
-        });
-        fs::write(&config_path, &stub).ok();
-    }
-
-    let socks_addr = if settings.socks_addr.contains(':') {
-        settings.socks_addr.clone()
-    } else {
-        format!("{}:1080", settings.socks_addr)
-    };
-
-    {
-        let mihomo_mgr = state.mihomo.lock().map_err(|e| e.to_string())?;
-        mihomo_mgr.install_service(&config_path)?;
-    }
-    {
-        let gc_mgr = state.go_client.lock().map_err(|e| e.to_string())?;
-        gc_mgr.install_service(&go_client::GoClientConfig {
-            conn_key: &settings.conn_key,
-            server_addr: "",
-            socks_addr: &socks_addr,
-            transport: "",
-            vpn_dns: &settings.vpn_dns,
-            hwid: settings.hwid,
-            tls_fingerprint: &settings.tls_fingerprint,
-            tls_fragment: settings.tls_fragment,
-            split_rules: &build_client_rules_json(&settings),
-        })?;
-    }
-
-    Ok("Services installed: WhisperaNH, WhisperaGW".to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2035,6 +1604,18 @@ fn open_vpn_settings() -> Result<(), String> {
 }
 
 #[tauri::command]
+fn set_app_language(lang: String) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        std::panic::catch_unwind(move || whisp_vpn_android::service_intent::set_language(&lang))
+            .map_err(|_| "panic in set_language".to_string())??;
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = lang;
+    Ok(())
+}
+
+#[tauri::command]
 async fn ping_key(key: String, mode: Option<String>) -> Result<u64, String> {
     let (host, port) = server_addr_from_key(&key).ok_or("cannot parse server address")?;
     let (host, port) = (host.as_str(), port);
@@ -2220,19 +1801,6 @@ fn icmp_checksum(data: &[u8]) -> u16 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
     !(sum as u16)
-}
-
-#[tauri::command]
-async fn uninstall_services(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    {
-        let mut mihomo_mgr = state.mihomo.lock().map_err(|e| e.to_string())?;
-        mihomo_mgr.uninstall_service()?;
-    }
-    {
-        let mut gc_mgr = state.go_client.lock().map_err(|e| e.to_string())?;
-        gc_mgr.uninstall_service()?;
-    }
-    Ok("Services removed".to_string())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2674,10 +2242,11 @@ fn stop_sidecars_and_exit(app: tauri::AppHandle) {
             std::thread::sleep(std::time::Duration::from_millis(1500));
             std::process::exit(0);
         });
+        restore_system_proxy(&app);
         let m_app = app.clone();
         let m = std::thread::spawn(move || {
             let state: tauri::State<AppState> = m_app.state();
-            let _ = state.mihomo.try_lock().map(|mut m| m.stop().ok());
+            let _ = state.mihomo.try_lock().map(|mut m| m.stop_tun().ok());
         });
         let g_app = app.clone();
         let g = std::thread::spawn(move || {
@@ -2808,7 +2377,6 @@ pub fn run() {
         .manage(AppState {
             mihomo: Mutex::new(MihomoManager::new(mihomo_path)),
             go_client: Mutex::new(GoClientManager::new(go_client_path)),
-            android_proxy: Mutex::new(None),
             external_engine: std::sync::atomic::AtomicBool::new(false),
         })
         .setup(|app| {
@@ -2822,6 +2390,7 @@ pub fn run() {
                 if let Ok(m) = state.mihomo.lock() {
                     m.kill_all_by_name();
                 }
+                restore_system_proxy(app.handle());
                 #[allow(clippy::drop_non_drop)]
                 drop(state);
                 if let Err(e) = ensure_controller_secret(app.handle()) {
@@ -2836,25 +2405,6 @@ pub fn run() {
             #[cfg(target_os = "android")]
             {
                 app.handle().plugin(tauri_plugin_barcode_scanner::init())?;
-
-                let init_app = app.handle().clone();
-                tauri::async_runtime::spawn_blocking(move || {
-                    if whisp_vpn_android::service_intent::is_vpn_service_running() {
-                        if let Ok(s) = get_app_settings(init_app.clone()) {
-                            if !s.conn_key.is_empty() {
-                                use sha2::Digest;
-                                let hash = sha2::Sha256::digest(s.conn_key.as_bytes());
-                                let pass: String =
-                                    hash.iter().map(|b| format!("{:02x}", b)).collect();
-                                let proxy_url = format!("socks5h://whisp:{}@127.0.0.1:1080", pass);
-                                let state: tauri::State<AppState> = init_app.state();
-                                if let Ok(mut p) = state.android_proxy.lock() {
-                                    *p = Some(proxy_url);
-                                };
-                            }
-                        }
-                    }
-                });
             }
 
             #[cfg(desktop)]
@@ -2909,21 +2459,13 @@ pub fn run() {
             list_processes,
             get_app_settings,
             save_app_setting,
-            patch_app_settings,
-            apply_tls_fingerprint,
             connect,
             disconnect,
             get_status,
             get_tunnel_state,
-            get_ip_info,
             get_system_info,
             open_config_dir,
             open_url,
-            install_services,
-            uninstall_services,
-            tunnel_service_installed,
-            install_tunnel_service,
-            remove_tunnel_service,
             get_routing_rules,
             save_routing_rules,
             get_vpn_log,
@@ -2942,22 +2484,7 @@ pub fn run() {
             ping_key,
             vpn_lockdown,
             open_vpn_settings,
-            get_connections,
-            close_connection,
-            toggle_connection,
-            toggle_obfuscation,
-            switch_transport,
-            set_connection_speed,
-            set_connection_sni,
-            set_connection_bridge,
-            duplicate_connection,
-            set_connection_mux,
-            change_connection_port,
-            set_transport_secure,
-            set_behavioral_profile,
-            get_agent_stats,
-            agent_recommend,
-            agent_report,
+            set_app_language,
             check_for_updates,
             install_update,
         ])

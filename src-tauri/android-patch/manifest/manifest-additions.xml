@@ -58,7 +58,7 @@ SERVICE:
             android:exported="true"
             android:process=":vpn"
             android:enabled="true">
-            <intent-filter>
+            <intent-filter android:priority="999">
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>

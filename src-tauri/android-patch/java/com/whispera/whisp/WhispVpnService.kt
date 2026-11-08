@@ -16,6 +16,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.telephony.TelephonyManager
 import android.util.Log
 import android.widget.Toast
 import goclient.Goclient
@@ -40,6 +41,7 @@ class WhispVpnService : VpnService() {
         const val EXTRA_AUTO_CONNECT = "com.whispera.whisp.EXTRA_AUTO_CONNECT"
         const val EXTRA_TUN_STACK = "com.whispera.whisp.EXTRA_TUN_STACK"
         const val EXTRA_QUIC = "com.whispera.whisp.EXTRA_QUIC"
+        const val EXTRA_SERVER_IPV6 = "com.whispera.whisp.EXTRA_SERVER_IPV6"
         const val EXTRA_MIXED_PORT = "com.whispera.whisp.EXTRA_MIXED_PORT"
         const val EXTRA_ALLOW_LAN  = "com.whispera.whisp.EXTRA_ALLOW_LAN"
         const val EXTRA_SOCKS_USER = "com.whispera.whisp.EXTRA_SOCKS_USER"
@@ -48,8 +50,30 @@ class WhispVpnService : VpnService() {
         const val CHANNEL_ID = "whisp_vpn_channel"
         const val CHANNEL_ID_EVENTS = "whisp_events"
         const val NOTIF_ID_EVENT = 18
+        const val PREFS = "whisp_vpn"
+        private const val USER_STOPPED = "user_stopped"
 
         @Volatile @JvmField var isRunning: Boolean = false
+
+        @JvmStatic
+        fun buildVpnNotification(context: Context): Notification {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                nm.createNotificationChannel(
+                    NotificationChannel(CHANNEL_ID, "Whisp VPN", NotificationManager.IMPORTANCE_LOW)
+                )
+            }
+            val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                Notification.Builder(context, CHANNEL_ID)
+            else
+                @Suppress("DEPRECATION") Notification.Builder(context)
+            return builder
+                .setContentTitle("Whisp VPN")
+                .setContentText(ServiceText.of(context).active)
+                .setSmallIcon(android.R.drawable.ic_lock_lock)
+                .setOngoing(true)
+                .build()
+        }
 
         @JvmStatic
         fun isActuallyRunning(ctx: Context): Boolean {
@@ -84,6 +108,7 @@ class WhispVpnService : VpnService() {
     private var pendingAutoConnect: Boolean = false
     private var pendingTunStack: String = "gvisor"
     private var pendingQuic: Boolean = false
+    private var pendingServerIpv6: String = "auto"
     private var pendingMixedPort: Int = 0
     private var pendingAllowLan: Boolean = false
     private var pendingSocksUser: String = ""
@@ -104,7 +129,7 @@ class WhispVpnService : VpnService() {
         mainHandler.post { Toast.makeText(this, "Whisp VPN: $msg", Toast.LENGTH_LONG).show() }
     }
 
-    private fun prefs() = getSharedPreferences("whisp_vpn", Context.MODE_PRIVATE)
+    private fun prefs() = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     private fun saveParams() {
         prefs().edit()
@@ -121,11 +146,13 @@ class WhispVpnService : VpnService() {
             .putBoolean("auto_connect", pendingAutoConnect)
             .putString("tun_stack", pendingTunStack)
             .putBoolean("quic", pendingQuic)
+            .putString("server_ipv6", pendingServerIpv6)
             .putBoolean("lockdown", lockdownActive())
             .putInt("mixed_port",     pendingMixedPort)
             .putBoolean("allow_lan",  pendingAllowLan)
             .putString("socks_user",  pendingSocksUser)
             .putString("socks_pass",  pendingSocksPass)
+            .putBoolean(USER_STOPPED, false)
             .apply()
     }
 
@@ -146,6 +173,7 @@ class WhispVpnService : VpnService() {
         pendingAutoConnect = p.getBoolean("auto_connect", false)
         pendingTunStack = p.getString("tun_stack", "gvisor") ?: "gvisor"
         pendingQuic = p.getBoolean("quic", false)
+        pendingServerIpv6 = p.getString("server_ipv6", "auto") ?: "auto"
         pendingMixedPort = p.getInt("mixed_port", 0)
         pendingAllowLan  = p.getBoolean("allow_lan", false)
         pendingSocksUser = p.getString("socks_user", "") ?: ""
@@ -153,26 +181,25 @@ class WhispVpnService : VpnService() {
         return true
     }
 
-    private fun clearParams() {
-        prefs().edit().clear().apply()
-    }
-
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         try {
             when (intent?.action) {
                 ACTION_STOP -> {
                     isRunning = false
-                    clearParams()
+                    prefs().edit().putBoolean(USER_STOPPED, true).apply()
                     stopVpn()
                     return START_NOT_STICKY
                 }
-                ACTION_BOOT -> {
+                ACTION_BOOT, VpnService.SERVICE_INTERFACE -> {
                     try { startForegroundCompat() } catch (t: Throwable) {
                         toast("startForeground: ${t.message}"); stopSelf(); return START_NOT_STICKY
                     }
-                    if (!restoreParams() || !pendingAutoConnect) {
+                    if (isRunning) return START_STICKY
+                    val startedBySystem = intent?.action == VpnService.SERVICE_INTERFACE
+                    if (!(startedBySystem || Autostart.isOn(this)) || !restoreParams()) {
                         stopVpn(); return START_NOT_STICKY
                     }
+                    prefs().edit().putBoolean(USER_STOPPED, false).apply()
                     isRunning = true
                     startVpnSafe()
                     return START_STICKY
@@ -195,13 +222,14 @@ class WhispVpnService : VpnService() {
                         pendingAutoConnect = (intent.getStringExtra(EXTRA_AUTO_CONNECT) ?: "0") == "1"
                         pendingTunStack = intent.getStringExtra(EXTRA_TUN_STACK)?.takeIf { it in listOf("system","gvisor","mixed") } ?: "gvisor"
                         pendingQuic = (intent.getStringExtra(EXTRA_QUIC) ?: "0") == "1"
+                        pendingServerIpv6 = intent.getStringExtra(EXTRA_SERVER_IPV6) ?: "auto"
                         pendingMixedPort = intent.getStringExtra(EXTRA_MIXED_PORT)?.toIntOrNull() ?: 0
                         pendingAllowLan  = (intent.getStringExtra(EXTRA_ALLOW_LAN) ?: "0") == "1"
                         pendingSocksUser = intent.getStringExtra(EXTRA_SOCKS_USER) ?: ""
                         pendingSocksPass = intent.getStringExtra(EXTRA_SOCKS_PASS) ?: ""
                         saveParams()
                     } else {
-                        if (!restoreParams()) { stopVpn(); return START_NOT_STICKY }
+                        if (prefs().getBoolean(USER_STOPPED, false) || !restoreParams()) { stopVpn(); return START_NOT_STICKY }
                     }
                     isRunning = true
                     startVpnSafe()
@@ -224,7 +252,7 @@ class WhispVpnService : VpnService() {
         stopping.set(false)
         didConnect = false
         if (VpnService.prepare(this) != null) {
-            toast("VPN permission not granted"); stopSelf(); return
+            toast(ServiceText.of(this).permissionDenied); stopSelf(); return
         }
 
         val pfd = try {
@@ -254,6 +282,8 @@ class WhispVpnService : VpnService() {
                     val goLogPath = "${filesDir.absolutePath}/go-client.log"
                     val fp = if (pendingTlsFingerprint.isNotEmpty() && pendingTlsFingerprint != "random") pendingTlsFingerprint else ""
                     Log.i(TAG, "go-client Start() in-process")
+                    runCatching { Goclient::class.java.getMethod("setServerIPv6", String::class.java).invoke(null, pendingServerIpv6) }
+                        .onFailure { Log.w(TAG, "go-client cannot set the server IP family, it keeps its default") }
                     Goclient.start(pendingConnKey, "127.0.0.1:1080", goLogPath, fp, pendingVpnDns, pendingRulesJson, pendingHwid)
                     socksAddr = "127.0.0.1:1080"
                     if (!waitForPort("127.0.0.1", 1080, 4000)) Log.w(TAG, "go-client did not bind on :1080 within 4s, proceeding anyway")
@@ -268,7 +298,8 @@ class WhispVpnService : VpnService() {
             } catch (t: Throwable) {
                 if (t is InterruptedException) return@Thread
                 Log.e(TAG, "singbox FATAL: ${t.stackTraceToString()}")
-                postEvent("Whisp VPN — ошибка", t.message ?: "Ошибка подключения")
+                val text = ServiceText.of(this)
+                postEvent(text.failedTitle, t.message ?: text.failedBody)
                 toast("singbox: ${t.javaClass.simpleName}: ${t.message ?: t.toString()}")
                 stopVpn()
             } finally {
@@ -345,15 +376,18 @@ class WhispVpnService : VpnService() {
             override fun onAvailable(network: Network) {
                 Log.i(TAG, "netcb onAvailable: $network")
                 setUnderlyingNetworks(arrayOf(network))
+                Goclient.setNetwork(networkDescriptor(cm, network, null))
                 if (didConnect && isRunning) wakeGoClient()
             }
             override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
                 Log.i(TAG, "netcb onCapabilitiesChanged: $network")
                 setUnderlyingNetworks(arrayOf(network))
+                Goclient.setNetwork(networkDescriptor(cm, network, capabilities))
             }
             override fun onLost(network: Network) {
                 Log.i(TAG, "netcb onLost: $network")
                 setUnderlyingNetworks(null)
+                Goclient.setNetwork("")
             }
         }
         Log.i(TAG, "registerNetworkCallback: registering")
@@ -364,6 +398,19 @@ class WhispVpnService : VpnService() {
             Log.w(TAG, "registerNetworkCallback: ${t.message}")
             networkCallback = null
         }
+    }
+
+    private fun networkDescriptor(cm: ConnectivityManager, network: Network, known: NetworkCapabilities?): String {
+        val caps = known ?: cm.getNetworkCapabilities(network) ?: return ""
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+            val operator = (getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager)?.networkOperator.orEmpty()
+            return if (operator.isEmpty()) "" else "cell:$operator"
+        }
+        val link = cm.getLinkProperties(network) ?: return ""
+        val gateway = link.routes.firstOrNull { it.isDefaultRoute && it.gateway != null }?.gateway?.hostAddress.orEmpty()
+        val dns = link.dnsServers.joinToString(",") { it.hostAddress.orEmpty() }
+        val kind = if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) "wifi" else "lan"
+        return "$kind:gw=$gateway;dns=$dns"
     }
 
     private fun unregisterNetworkCallback() {
@@ -420,7 +467,7 @@ class WhispVpnService : VpnService() {
 
     override fun onDestroy() {
         if (didConnect && isRunning) {
-            postEvent("Whisp VPN", "Соединение прервано")
+            postEvent("Whisp VPN", ServiceText.of(this).interrupted)
         }
         isRunning = false
         try { stopVpn() } catch (_: Throwable) {}
@@ -430,9 +477,8 @@ class WhispVpnService : VpnService() {
     private fun ensureEventsChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        if (nm.getNotificationChannel(CHANNEL_ID_EVENTS) != null) return
         nm.createNotificationChannel(
-            NotificationChannel(CHANNEL_ID_EVENTS, "Whisp VPN события", NotificationManager.IMPORTANCE_DEFAULT)
+            NotificationChannel(CHANNEL_ID_EVENTS, ServiceText.of(this).eventsChannel, NotificationManager.IMPORTANCE_DEFAULT)
         )
     }
 
@@ -479,22 +525,5 @@ class WhispVpnService : VpnService() {
         @Suppress("DEPRECATION") stopForeground(true)
     }
 
-    private fun buildNotification(): Notification {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            nm.createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "Whisp VPN", NotificationManager.IMPORTANCE_LOW)
-            )
-        }
-        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-            Notification.Builder(this, CHANNEL_ID)
-        else
-            @Suppress("DEPRECATION") Notification.Builder(this)
-        return builder
-            .setContentTitle("Whisp VPN")
-            .setContentText("VPN активен")
-            .setSmallIcon(android.R.drawable.ic_lock_lock)
-            .setOngoing(true)
-            .build()
-    }
+    private fun buildNotification(): Notification = buildVpnNotification(this)
 }

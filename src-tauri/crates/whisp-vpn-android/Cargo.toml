@@ -2,19 +2,8 @@
 name = "whisp-vpn-android"
 version = "0.1.0"
 edition = "2021"
-description = "Whisp VPN core for Android — JNI bindings around a Rust rules/transport engine, driven by android.net.VpnService."
+description = "Whisp Android glue: VpnService intents and the installed-package list, over JNI."
 publish = false
-
-[lib]
-crate-type = ["cdylib", "staticlib", "rlib"]
-
-[dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# JNI — бридж между Android/Kotlin и Rust. Активируется только когда
-# мы реально целимся в android (android feature или target_os=android).
-jni = { version = "0.21", optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
@@ -22,10 +11,3 @@ jni = "0.21"
 # поэтому android_context() возвращает рабочую пару (VM, Context) без нашей
 # дополнительной инициализации.
 ndk-context = "0.1"
-# Передача TUN-fd в spawned mihomo: std::process::Command по дефолту ставит
-# FD_CLOEXEC, нужно явно снять флаг через fcntl в pre_exec callback.
-libc = "0.2"
-
-[features]
-default = []
-jni-bindings = ["jni"]

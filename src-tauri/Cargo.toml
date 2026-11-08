@@ -40,15 +40,13 @@ tauri-plugin-autostart = "~2.5"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinInet", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 tauri-plugin-updater = "2"
 
 [target.'cfg(target_os = "android")'.dependencies]
-# Нативный VPN-ядро для Android (чистый Rust rules engine + JNI-мост).
-# На desktop не подключается: там роутинг делает mihomo sidecar.
-whisp-vpn-android = { path = "crates/whisp-vpn-android", features = ["jni-bindings"] }
+whisp-vpn-android = { path = "crates/whisp-vpn-android" }
 tauri-plugin-barcode-scanner = "2"
 
 [features]

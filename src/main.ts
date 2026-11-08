@@ -1,8 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
+import { onBackButtonPress } from "@tauri-apps/api/app";
+import type { PluginListener } from "@tauri-apps/api/core";
 import { writeText as clipboardWrite, readText as clipboardRead } from "@tauri-apps/plugin-clipboard-manager";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { readTextFile } from "@tauri-apps/plugin-fs";
-import { scan as qrScan, Format as QrFormat, checkPermissions as qrCheckPermissions, requestPermissions as qrRequestPermissions } from "@tauri-apps/plugin-barcode-scanner";
+import { scan as qrScan, cancel as qrCancel, Format as QrFormat, checkPermissions as qrCheckPermissions, requestPermissions as qrRequestPermissions } from "@tauri-apps/plugin-barcode-scanner";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { renderSVG as renderQrSvg } from "uqr";
 import "./styles.css";
@@ -10,6 +12,7 @@ import "./styles.css";
 const ICONS = {
   power: `<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>`,
   plus: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>`,
+  chevronDown: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>`,
   bolt: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`,
   home: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>`,
   user: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>`,
@@ -39,6 +42,8 @@ interface AppSettings {
   kill_switch: boolean;
   dns_redirect: boolean;
   ipv6: boolean;
+  ipv6_fallback?: boolean;
+  ipv6_only?: boolean;
   tun_stack: string;
   hwid: boolean;
   auth_tip: boolean;
@@ -62,6 +67,7 @@ interface AppSettings {
   mtu?: number;
   tls_fragment?: boolean;
   sub_auto_update?: boolean;
+  proxy_mode?: string;
 }
 
 interface Profile { id: string; name: string; key: string; }
@@ -87,20 +93,18 @@ interface RoutingRule {
 
 const i18n: Record<Lang, Record<string, string>> = {
   ru: {
-    home: "Главная", profiles: "Профили", routing: "Маршруты", logs: "Журнал", settings: "Настройки",
+    home: "Главная", routing: "Маршруты", logs: "Журнал", settings: "Настройки",
     disconnected: "Отключено", connected: "Подключено",
     keyPlaceholder: "Вставьте ключ...", noKeySelected: "Нет ключа", connect: "Connect", disconnect: "Disconnect",
-    ipInfo: "IP ИНФОРМАЦИЯ", ipAddress: "IP Адрес", location: "Местоположение", provider: "Провайдер",
-    system: "СИСТЕМА", os: "ОС", uptime: "Время работы", version: "Версия", admin: "Админ",
-    activeConns: "Активные соединения", connectToSee: "Подключитесь чтобы увидеть соединения",
-    noProfiles: "Нет сохранённых профилей", addProfile: "Добавить ключ",
+    system: "СИСТЕМА",
+    addProfile: "Добавить ключ",
     keysSection: "Ключи", noKeys: "Нет сохранённых ключей и подписок",
-    pasteFromClipboard: "Вставить из буфера обмена", scanQr: "Сканировать QR-код", qrScanFailed: "Не удалось отсканировать QR-код", pasteJson: "Импорт JSON из файла", copyJson: "Копировать JSON",
-    shareQr: "Поделиться QR-кодом", shareQrHint: "На другом устройстве: «+» → «Сканировать QR-код»", shareQrReveal: "Нажмите, чтобы показать",
+    pasteFromClipboard: "Вставить из буфера обмена", qrScanFailed: "Не удалось отсканировать QR-код", pasteJson: "Импорт JSON из файла", copyJson: "Копировать JSON",
+    qrCode: "QR-код", qrTabShare: "Поделиться", qrTabScan: "Сканировать", qrScanHint: "Наведите камеру на QR-код", shareQrHint: "На другом устройстве: «+» → «QR-код» → «Сканировать»",
     shareQrWarning: "Кто увидит этот код, получит доступ к вашему ключу", shareQrTooLong: "Превышена допустимая длина QR-кода. Используйте «Копировать»",
-    nothingToShare: "Нет ключей и подписок, чтобы поделиться", shareKindKey: "Ключ", shareKindSub: "Подписка", close: "Закрыть",
-    jsonData: "JSON", jsonParseError: "Некорректный JSON", jsonImported: "Импортировано записей:", jsonCopied: "JSON скопирован в буфер обмена",
-    clipboardEmpty: "Буфер обмена пуст", clipboardReadFailed: "Не удалось прочитать буфер обмена", clipboardWriteFailed: "Не удалось скопировать в буфер обмена",
+    nothingToShare: "Нет доступных ключей", shareKindKey: "Ключ", shareKindSub: "Подписка", close: "Закрыть",
+    jsonParseError: "Некорректный JSON", jsonImported: "Импортировано записей:", jsonCopied: "JSON скопирован в буфер обмена",
+    clipboardReadFailed: "Не удалось прочитать буфер обмена", clipboardWriteFailed: "Не удалось скопировать в буфер обмена",
     pasteUnrecognized: "Не удалось распознать содержимое. Ожидается whispera:// ключ или https:// ссылка",
     refreshAllSubs: "Обновить подписки", subsRefreshedSummary: "Обновлено подписок:",
     subAutoUpdateOn: "Автообновление: Вкл", subAutoUpdateOff: "Автообновление: Выкл",
@@ -108,30 +112,24 @@ const i18n: Record<Lang, Record<string, string>> = {
     mixedPort: "Смешанный порт ", bindAddr: "Привязать адрес ", tunStack: "Tun Stack ", shareProxy: "Общий доступ к прокси",
     theme: "Тема ", dark: "Тёмная", auto: "Белая", dnsRedirect: "DNS перенаправление ",
     ipv6Label: "IPv6 ", secretLabel: "Secret ", copy: "Копировать",
-    autostart: "Автозапуск ", externalLink: "Внешний профиль ", externalHint: "Ссылка vless:// trojan:// ss:// — туннель ведёт mihomo, наш клиент не запускается. Пусто = свой протокол", authTip: "Совет по аутентификации ",
+    ipv6FallbackLabel: "IPv6, если IPv4 сервера недоступен ", ipv6OnlyLabel: "К серверу только по IPv6 ",
+    autostart: "Автозапуск ",
     config: "Конфиг ", open: "Открыть", update: "Обновить ",
     openRepo: "Открыть репо", checkUpdates: "Проверить обновления", checking: "Проверка",
     installed: "Установлено в актуальной версии",
     profileName: "Имя профиля", profileKey: "Ключ подключения",
     save: "Сохранить", cancel: "Отмена",
     mihomo: "MIHOMO", whisp: "WHISP",
-    tunnel: "ТУННЕЛЬ", server: "Сервер", duration: "Длительность",
-    proxy: "ПРОКСИ", port: "Порт", notSet: "не задан",
-    clearLogs: "Очистить", active: "Активно", inactive: "Неактивно",
-    connecting: "Подключение...", disconnecting: "Отключение...",
+    clearLogs: "Очистить", active: "Активно",
+    connecting: "Подключение...",
+    fail_network_down: "Нет интернета: не отвечает даже российский адрес", fail_foreign_cut: "Работает только российский интернет: зарубежные адреса недоступны", fail_server_unreachable: "Сервер не отвечает, хотя остальной интернет работает: его IP заблокирован или сервер выключен", fail_server_refused: "Сервер отклоняет подключения: служба на нём не запущена", fail_handshake_blocked: "Подключение блокируется по пути", fail_live_blocked: "Соединения обрываются во время передачи", wire_forged_reset: "подменённый сброс (RST)", wire_hello_dropped: "приветствие TLS не доходит", wire_cut_off: "обрыв посреди рукопожатия", wire_retransmitted: "пакеты теряются", failFreezeAt: "заморозка после {kb} КБ", failNewPattern: "такого типа блокировки не было в обучении", failWhileConnected: "Новые подключения не проходят",
     killSwitch: "Kill Switch",
-    routingTitle: "Маршруты", routingDesc: "Укажите приложения или сайты которые идут напрямую или через прокси",
-    addSite: "Добавить сайт", addApp: "Выбрать приложение", domain: "Домен", app: "Приложение",
-    routeDirect: "Напрямую", routeProxy: "Прокси", noRules: "Правила не добавлены",
-    domainHint: "Например: steampowered.com",
-    blocklist: "Блок-лист", blocklistTitle: "Блок-лист", blocklistDesc: "Заблокированные домены и приложения — трафик полностью блокируется",
-    blockDomain: "Заблокировать домен", blockApp: "Заблокировать приложение", blockKeyword: "По ключевому слову", blockIp: "Заблокировать IP/CIDR",
-    noBlocked: "Список пуст", blocked: "Заблокирован", domainBlockHint: "Например: tiktok.com",
-    keywordHint: "Например: tracker", ipHint: "Например: 1.2.3.0/24",
-    subscriptions: "Подписки", addSubscription: "Добавить подписку",
+    routingTitle: "Маршруты",
+    domain: "Домен", app: "Приложение",
+    addSubscription: "Добавить подписку",
     subName: "Название", subUrl: "URL подписки", keyJson: "Показать JSON", keyJsonTitle: "Конфигурация ключа", keyJsonForeign: "Чужой протокол — только просмотр", keyJsonBad: "Не удалось разобрать ключ", keyJsonSaved: "Ключ обновлён", subUrlHint: "https://server/sub/TOKEN",
-    noSubscriptions: "Нет подписок", subKeys: "ключей", subRefreshing: "Обновление...", subAdded: "Подписка добавлена",
-    subRefresh: "Обновить", subDelete: "Удалить", subLastUpdated: "Обновлено",
+    noSubscriptions: "Нет подписок", subRefreshing: "Обновление...", subAdded: "Подписка добавлена",
+    subRefresh: "Обновить", subDelete: "Удалить",
     subSelectKey: "Выбрать ключ", subRename: "Переименовать", more: "Ещё",
     pingWhileOn: "Замер доступен только при отключённом туннеле", pingKey: "Пинг", pingAll: "Пинг всех", pingMs: "мс", pingTimeout: "timeout", pingError: "ошибка", pingRunning: "...",
     loading: "Загрузка…",
@@ -139,67 +137,16 @@ const i18n: Record<Lang, Record<string, string>> = {
     vpnConnected: "Подключено",
     switchingKey: "Переключение ключа...", pleaseWait: "Подождите, идёт переключение...",
     vpnDisconnected: "Отключено",
-    muxOn: "MUX включён",
-    muxOff: "MUX выключен",
-    muxEnabled: "MUX включён",
-    muxDisabled: "MUX выключен",
-    connClosed: "Соединение закрыто",
-    bridgeUpdated: "Мост обновлён",
-    speedUpdated: "Скорость обновлена",
-    portUpdated: "Порт обновлён",
-    noRecommendation: "Нет рекомендации",
-    noActiveConns: "Нет активных соединений",
-    agentTransport: "Агент транспорта",
-    agentNotRunning: "Агент не запущен",
-    agentTransportUCB: "Агент транспорта (UCB)",
-    agentState: "Состояние",
-    agentProbesRotations: "Зондов / ротаций",
-    agentQValues: "Q-значения транспортов",
-    agentApply: "Применить рекомендацию",
-    agentRefresh: "Обновить",
-    agentIdle: "ожидание",
-    agentProbing: "зондирование",
-    agentRotating: "ротация",
-    agentConnected: "подключён",
-    agentBlocked: "заблокирован",
-    agentNoData: "нет данных",
-    connCountLabel: "Соединений",
-    connNoActive: "Нет активных соединений",
-    connKeyEncrypted: "зашифрован",
-    connStatusActive: "активно",
-    connStatusConnecting: "подключение",
-    connStatusFailed: "ошибка",
-    connStatusOff: "откл.",
-    connMuxTitle: "Мультиплексирование",
-    connDuplicate: "Дублировать",
-    connDup: "Дублировано",
-    connClose: "Закрыть соединение",
-    connApply: "Применить",
-    connPort: "Порт",
-    connBridge: "Мост",
-    connSpeed: "Скорость KB/s",
-    connObfs: "Обфускация (приманка)",
-    connTransportSecureTitle: "Когда ВКЛЮЧЕНО — доверяет встроенному шифрованию транспорта (TLS/QUIC) и пропускает двойную обфускацию. ВЫКЛЮЧЕНО по умолчанию — обфускация применяется поверх любого транспорта для защиты от ТСПУ/DPI.",
-    connMarionetteTitle: "Marionette имитирует поведение мессенджера — паттерны трафика, тайминги, размеры пакетов. Выберите профиль, ближайший к реальному использованию. Нейросеть может менять профиль автоматически.",
-    connTransportSecureOn: "Transport Secure ON — двойная обфускация отключена",
-    connTransportSecureOff: "Transport Secure OFF — обфускация всегда включена",
-    marionetteDisabled: "Marionette отключён",
-    profileNone: "— нет —",
-    profileMusicSep: "── Музыка ──",
-    profileVideoSep: "── Видео ──",
-    fpRandom: "Случайный",
-    fpBrowser: "Браузер",
-    fpApplyNow: "Применить",
     ruleBlock: "Блок",
     ruleDirect: "Прямой",
-    ruleSite: "сайт",
+    ruleSite: "домен",
     ruleKeyword: "ключ",
     ruleApp: "приложение",
     ruleNoRules: "Нет правил",
     ruleViaVpn: "Прокси",
     ruleDirect2: "Напрямую",
     ruleAdd: "Добавить правило",
-    ruleSiteType: "Сайт",
+    ruleSiteType: "Домен",
     ruleAppType: "Приложение",
     ruleKeywordType: "Ключевое слово",
     rulePlaceholder: "например: youtube.com",
@@ -215,83 +162,57 @@ const i18n: Record<Lang, Record<string, string>> = {
     subUpdateAvailableToast: "Доступно обновление подписки",
     subUpdateFailed: "Ошибка обновления",
     secretCopied: "Secret скопирован",
-    updateAvailable: "Установлена актуальная версия",
-    updateCheckFailed: "Не удалось проверить обновления",
     reconnectToApply: "Изменение вступит в силу после переподключения",
-    dnsServers: "DNS серверы",
-    dnsCommaSep: "Через запятую, пусто = по умолчанию",
-    vpnDns: "Прокси DNS (клиент)",
-    vpnDnsHint: "DNS для прокси-клиента. 'Провайдер' = системный резолвер",
+    dnsServers: "DNS для прямых соединений",
+    dnsCommaSep: "По умолчанию пусто",
+    vpnDns: "Укажите DNS:",
     dnsMode: "Режим DNS",
     dnsStrategy: "DNS-резолвер",
     dnsFakeip: "Поддельный",
     dnsLocal: "Локальный",
-    dnsStrategyHint: "Поддельный (fake-IP) — домены резолвятся внутри тоннеля, IP не видны провайдеру. Локальный — системный резолвер устройства.",
     killSwitchLabel: "Kill Switch",
-    killSwitchOn: "Система блокирует соединения без VPN",
-    killSwitchOff: "Соединения без VPN не блокируются",
     killSwitchOpen: "Настройки системы",
+    modeProxy: "Прокси",
     tunStackLabel: "Сетевой стек",
-    tunStackHint: "gVisor — свой стек в пространстве приложения, работает везде. Системный — быстрее, но на Android без root не тянет IPv6. Смешанный — TCP системный, UDP через gVisor.",
     quicLabel: "Разрешить QUIC",
-    quicHint: "При TCP-транспорте QUIC идёт внутри туннеля поверх TCP — двойное управление перегрузкой и повторы поверх надёжного канала. Выключено: QUIC отклоняется и приложение само берёт TCP напрямую, обычно это быстрее.",
     pingModeLabel: "Способ проверки",
-    pingModeHint: "TCP — время установки соединения. GET и HEAD — полный HTTP-запрос, ближе к реальной загрузке. ICMP идёт мимо туннеля: наш протокол несёт только TCP и UDP.",
     mtuLabel: "MTU",
-    mtuHint: "Размер MTU для TUN-интерфейса (576–9000, по умолчанию 1500)",
     tlsFragment: "Фрагментация TLS",
-    tlsFragmentHint: "Разбивает TLS ClientHello на несколько TCP-сегментов, чтобы DPI не видел SNI целиком",
     isp: "Провайдер",
+    dnsService: "Сервис", dnsPrimary: "Основной", dnsSecondary: "Дополнительный", dnsCustom: "Свой", dnsCustomHint: "IP или https://…",
     bypassMode: "Режим обхода",
     bypassModeHint: "GeoIP и домены вашей страны автоматически идут напрямую.",
     advanced: "Расширенные",
     allowLan: "Разрешить LAN",
     allowLanHint: "Другие устройства в сети смогут использовать прокси",
-    logLevel: "Уровень логов",
     routingMode: "Режим маршрутизации",
     socksAuth: "SOCKS5 аутентификация",
     socksUser: "Логин",
     socksPass: "Пароль",
-    socksProxyUrl: "URL прокси",
-    socksAuthHint: "Пусто — порт открыт без пароля",
     socksShow: "Показать пароль",
     socksHide: "Скрыть пароль",
     socksSave: "Сохранить",
     reconnectRequired: "Переподключитесь для применения правила",
     logSearchPlaceholder: "Поиск в логах...",
     logAll: "Все",
-    transportSet: "Транспорт →",
-    duplicated: "Дублировано",
-    duplicatedTo: "Дублировано →",
-    profileSet: "Профиль:",
-    fingerprintSet: "Фингерпринт:",
-    analysisDone: "Анализ завершён — риск DPI:",
-    foundPorts: "Найдено",
-    openPorts: "открытых портов",
-    versionAvail: "Доступна версия",
     updateAvailableNew: "Доступно обновление",
-    upToDate: "Последняя версия установлена",
     installUpdate: "Установить",
     openRelease: "Открыть релиз",
     currentVersion: "Текущая версия",
-    latestVersion: "Последняя версия",
-    releaseNotes: "Изменения",
   },
   en: {
-    home: "Home", profiles: "Profiles", routing: "Routing", logs: "Logs", settings: "Settings",
+    home: "Home", routing: "Routing", logs: "Logs", settings: "Settings",
     disconnected: "Disconnected", connected: "Connected",
     keyPlaceholder: "Paste key...", noKeySelected: "No key", connect: "Connect", disconnect: "Disconnect",
-    ipInfo: "IP INFORMATION", ipAddress: "IP Address", location: "Location", provider: "Provider",
-    system: "SYSTEM", os: "OS", uptime: "Uptime", version: "Version", admin: "Admin",
-    activeConns: "Active connections", connectToSee: "Connect to see connections",
-    noProfiles: "No saved profiles", addProfile: "Add key",
+    system: "SYSTEM",
+    addProfile: "Add key",
     keysSection: "Keys", noKeys: "No saved keys or subscriptions",
-    pasteFromClipboard: "Paste from clipboard", scanQr: "Scan QR code", qrScanFailed: "Failed to scan QR code", pasteJson: "Import JSON file", copyJson: "Copy JSON",
-    shareQr: "Share via QR code", shareQrHint: "On the other device: + → Scan QR code", shareQrReveal: "Tap to reveal",
+    pasteFromClipboard: "Paste from clipboard", qrScanFailed: "Failed to scan QR code", pasteJson: "Import JSON file", copyJson: "Copy JSON",
+    qrCode: "QR code", qrTabShare: "Share", qrTabScan: "Scan", qrScanHint: "Point the camera at a QR code", shareQrHint: "On the other device: + → QR code → Scan",
     shareQrWarning: "Anyone who sees this code gets access to your key", shareQrTooLong: "Exceeds the maximum QR code length. Use Copy",
-    nothingToShare: "No keys or subscriptions to share", shareKindKey: "Key", shareKindSub: "Subscription", close: "Close",
-    jsonData: "JSON", jsonParseError: "Invalid JSON", jsonImported: "Imported entries:", jsonCopied: "JSON copied to clipboard",
-    clipboardEmpty: "Clipboard is empty", clipboardReadFailed: "Failed to read clipboard", clipboardWriteFailed: "Failed to copy to clipboard",
+    nothingToShare: "No keys available", shareKindKey: "Key", shareKindSub: "Subscription", close: "Close",
+    jsonParseError: "Invalid JSON", jsonImported: "Imported entries:", jsonCopied: "JSON copied to clipboard",
+    clipboardReadFailed: "Failed to read clipboard", clipboardWriteFailed: "Failed to copy to clipboard",
     pasteUnrecognized: "Could not recognize the content. Expected a whispera:// key or an https:// link",
     refreshAllSubs: "Refresh subscriptions", subsRefreshedSummary: "Subscriptions refreshed:",
     subAutoUpdateOn: "Auto-update: On", subAutoUpdateOff: "Auto-update: Off",
@@ -299,30 +220,24 @@ const i18n: Record<Lang, Record<string, string>> = {
     mixedPort: "Mixed port ", bindAddr: "Bind address ", tunStack: "Tun Stack ", shareProxy: "Share proxy",
     theme: "Theme ", dark: "Dark", auto: "Light", dnsRedirect: "DNS redirect ",
     ipv6Label: "IPv6 ", secretLabel: "Secret ", copy: "Copy",
-    autostart: "Autostart ", externalLink: "External profile ", externalHint: "A vless:// trojan:// ss:// link — mihomo carries the tunnel, our client stays off. Empty = own protocol", authTip: "Auth tip ",
+    ipv6FallbackLabel: "IPv6 if the server's IPv4 is blocked ", ipv6OnlyLabel: "Server over IPv6 only ",
+    autostart: "Autostart ",
     config: "Config ", open: "Open", update: "Update ",
     openRepo: "Open repo", checkUpdates: "Check updates", checking: "Checking",
     installed: "Latest version installed",
     profileName: "Profile name", profileKey: "Connection key",
     save: "Save", cancel: "Cancel",
     mihomo: "MIHOMO", whisp: "WHISP",
-    tunnel: "TUNNEL", server: "Server", duration: "Duration",
-    proxy: "PROXY", port: "Port", notSet: "not set",
-    clearLogs: "Clear", active: "Active", inactive: "Inactive",
-    connecting: "Connecting...", disconnecting: "Disconnecting...",
+    clearLogs: "Clear", active: "Active",
+    connecting: "Connecting...",
+    fail_network_down: "No internet: even the domestic control address does not answer", fail_foreign_cut: "Only domestic internet works: foreign addresses are unreachable", fail_server_unreachable: "The server does not answer while the rest of the internet does: its IP is blocked or the server is off", fail_server_refused: "The server refuses connections: its service is not running", fail_handshake_blocked: "The connection is blocked on the way", fail_live_blocked: "Connections are cut while carrying data", wire_forged_reset: "forged reset (RST)", wire_hello_dropped: "the TLS hello does not get through", wire_cut_off: "cut off mid-handshake", wire_retransmitted: "packets are lost", failFreezeAt: "freeze after {kb} KB", failNewPattern: "a block type not seen in training", failWhileConnected: "New connections fail",
     killSwitch: "Kill Switch",
-    routingTitle: "Routing", routingDesc: "Specify apps or sites that go direct or through proxy",
-    addSite: "Add site", addApp: "Browse app", domain: "Domain", app: "Application",
-    routeDirect: "Direct", routeProxy: "Proxy", noRules: "No rules added",
-    domainHint: "e.g. steampowered.com",
-    blocklist: "Blocklist", blocklistTitle: "Blocklist", blocklistDesc: "Blocked domains and apps — traffic is completely rejected",
-    blockDomain: "Block domain", blockApp: "Block application", blockKeyword: "By keyword", blockIp: "Block IP/CIDR",
-    noBlocked: "List is empty", blocked: "Blocked", domainBlockHint: "e.g. tiktok.com",
-    keywordHint: "e.g. tracker", ipHint: "e.g. 1.2.3.0/24",
-    subscriptions: "Subscriptions", addSubscription: "Add subscription",
+    routingTitle: "Routing",
+    domain: "Domain", app: "Application",
+    addSubscription: "Add subscription",
     subName: "Name", subUrl: "Subscription URL", keyJson: "Show JSON", keyJsonTitle: "Key configuration", keyJsonForeign: "Foreign protocol — view only", keyJsonBad: "Could not parse the key", keyJsonSaved: "Key updated", subUrlHint: "https://server/sub/TOKEN",
-    noSubscriptions: "No subscriptions", subKeys: "keys", subRefreshing: "Refreshing...", subAdded: "Subscription added",
-    subRefresh: "Refresh", subDelete: "Delete", subLastUpdated: "Updated",
+    noSubscriptions: "No subscriptions", subRefreshing: "Refreshing...", subAdded: "Subscription added",
+    subRefresh: "Refresh", subDelete: "Delete",
     subSelectKey: "Use key", subRename: "Rename", more: "More",
     pingWhileOn: "Measurement works only while disconnected", pingKey: "Ping", pingAll: "Ping all", pingMs: "ms", pingTimeout: "timeout", pingError: "error", pingRunning: "...",
     loading: "Loading…",
@@ -330,67 +245,16 @@ const i18n: Record<Lang, Record<string, string>> = {
     vpnConnected: "Connected",
     switchingKey: "Switching key...", pleaseWait: "Please wait, switching in progress...",
     vpnDisconnected: "Disconnected",
-    muxOn: "MUX on",
-    muxOff: "MUX off",
-    muxEnabled: "MUX enabled",
-    muxDisabled: "MUX disabled",
-    connClosed: "Connection closed",
-    bridgeUpdated: "Bridge updated",
-    speedUpdated: "Speed updated",
-    portUpdated: "Port updated",
-    noRecommendation: "No recommendation",
-    noActiveConns: "No active connections",
-    agentTransport: "Transport Agent",
-    agentNotRunning: "Agent not running",
-    agentTransportUCB: "Transport Agent (UCB)",
-    agentState: "State",
-    agentProbesRotations: "Probes / rotations",
-    agentQValues: "Transport Q-values",
-    agentApply: "Apply recommendation",
-    agentRefresh: "Refresh",
-    agentIdle: "idle",
-    agentProbing: "probing",
-    agentRotating: "rotating",
-    agentConnected: "connected",
-    agentBlocked: "blocked",
-    agentNoData: "no data",
-    connCountLabel: "Connections",
-    connNoActive: "No active connections",
-    connKeyEncrypted: "encrypted",
-    connStatusActive: "active",
-    connStatusConnecting: "connecting",
-    connStatusFailed: "failed",
-    connStatusOff: "off",
-    connMuxTitle: "Multiplexing",
-    connDuplicate: "Duplicate",
-    connDup: "Duplicated",
-    connClose: "Close connection",
-    connApply: "Apply",
-    connPort: "Port",
-    connBridge: "Bridge",
-    connSpeed: "Speed KB/s",
-    connObfs: "Obfuscation (bait)",
-    connTransportSecureTitle: "When ON — trusts the transport's built-in encryption (TLS/QUIC) and skips double-obfuscation. OFF by default — obfuscation is always applied on top of any transport to defeat DPI/TSPU.",
-    connMarionetteTitle: "Marionette mimics messenger traffic behaviour — patterns, timings, packet sizes. Pick a profile matching your actual usage. The neural network can switch profiles automatically.",
-    connTransportSecureOn: "Transport Secure ON — double-obfuscation disabled",
-    connTransportSecureOff: "Transport Secure OFF — obfuscation always active",
-    marionetteDisabled: "Marionette disabled",
-    profileNone: "— none —",
-    profileMusicSep: "── Music ──",
-    profileVideoSep: "── Video ──",
-    fpRandom: "Random",
-    fpBrowser: "Browser",
-    fpApplyNow: "Apply Now",
     ruleBlock: "Block",
     ruleDirect: "Direct",
-    ruleSite: "site",
+    ruleSite: "domain",
     ruleKeyword: "keyword",
     ruleApp: "app",
     ruleNoRules: "No rules",
     ruleViaVpn: "Proxy",
     ruleDirect2: "Direct",
     ruleAdd: "Add rule",
-    ruleSiteType: "Site",
+    ruleSiteType: "Domain",
     ruleAppType: "App",
     ruleKeywordType: "Keyword",
     rulePlaceholder: "e.g. youtube.com",
@@ -406,83 +270,57 @@ const i18n: Record<Lang, Record<string, string>> = {
     subUpdateAvailableToast: "Subscription update available",
     subUpdateFailed: "Update failed",
     secretCopied: "Secret copied",
-    updateAvailable: "Already up to date",
-    updateCheckFailed: "Update check failed",
     reconnectToApply: "Change will take effect after reconnecting",
-    dnsServers: "DNS Servers",
-    dnsCommaSep: "Comma-separated, empty = default",
-    vpnDns: "Proxy DNS (client)",
-    vpnDnsHint: "DNS for the proxy client. 'ISP' = system resolver",
+    dnsServers: "Direct DNS",
+    dnsCommaSep: "Empty by default",
+    vpnDns: "Set your DNS:",
     dnsMode: "DNS mode",
     dnsStrategy: "DNS resolver",
     dnsFakeip: "Fake-IP",
     dnsLocal: "Local",
-    dnsStrategyHint: "Fake-IP — domains resolved inside the tunnel, IPs hidden from the ISP. Local — device's system resolver.",
     killSwitchLabel: "Kill switch",
-    killSwitchOn: "The system blocks connections without a VPN",
-    killSwitchOff: "Connections without a VPN are not blocked",
     killSwitchOpen: "System settings",
+    modeProxy: "Proxy",
     tunStackLabel: "Network stack",
-    tunStackHint: "gVisor — userspace stack, works everywhere. System — faster, but on Android carries no IPv6 without root. Mixed — system TCP, gVisor UDP.",
     quicLabel: "Allow QUIC",
-    quicHint: "On a TCP transport QUIC travels inside the tunnel over TCP — congestion control and retransmits stacked on an already reliable channel. Off: QUIC is rejected and the app takes plain TCP itself, usually faster.",
     pingModeLabel: "Check method",
-    pingModeHint: "TCP — connection setup time. GET and HEAD — a full HTTP request, closer to real loading. ICMP goes outside the tunnel: our protocol carries only TCP and UDP.",
     mtuLabel: "MTU",
-    mtuHint: "MTU size for the TUN interface (576–9000, default 1500)",
     tlsFragment: "TLS fragmentation",
-    tlsFragmentHint: "Splits the TLS ClientHello across several TCP segments so DPI can't read the whole SNI",
     isp: "ISP",
+    dnsService: "Service", dnsPrimary: "Primary", dnsSecondary: "Secondary", dnsCustom: "Custom", dnsCustomHint: "IP or https://…",
     bypassMode: "Bypass Mode",
     bypassModeHint: "GeoIP and domains from your country are automatically routed to direct.",
     advanced: "Advanced",
     allowLan: "Allow LAN",
     allowLanHint: "Other devices on the network can use this proxy",
-    logLevel: "Log Level",
     routingMode: "Routing Mode",
     socksAuth: "SOCKS5 Authentication",
     socksUser: "Username",
     socksPass: "Password",
-    socksProxyUrl: "Proxy URL",
-    socksAuthHint: "Empty means the port is open without a password",
     socksShow: "Show password",
     socksHide: "Hide password",
     socksSave: "Save",
     reconnectRequired: "Reconnect to apply the rule",
     logSearchPlaceholder: "Search logs...",
     logAll: "All",
-    transportSet: "Transport →",
-    duplicated: "Duplicated",
-    duplicatedTo: "Duplicated →",
-    profileSet: "Profile:",
-    fingerprintSet: "Fingerprint:",
-    analysisDone: "Analysis done — DPI risk:",
-    foundPorts: "Found",
-    openPorts: "open ports",
-    versionAvail: "Version available:",
     updateAvailableNew: "Update Available",
-    upToDate: "Up to date",
     installUpdate: "Install",
     openRelease: "Open Release",
     currentVersion: "Current version",
-    latestVersion: "Latest version",
-    releaseNotes: "Release notes",
   },
   zh: {
-    home: "主页", profiles: "配置", routing: "路由", logs: "日志", settings: "设置",
+    home: "主页", routing: "路由", logs: "日志", settings: "设置",
     disconnected: "已断开", connected: "已连接",
     keyPlaceholder: "粘贴密钥...", noKeySelected: "无密钥", connect: "连接", disconnect: "断开",
-    ipInfo: "IP信息", ipAddress: "IP地址", location: "位置", provider: "运营商",
-    system: "系统", os: "操作系统", uptime: "运行时间", version: "版本", admin: "管理员",
-    activeConns: "活跃连接", connectToSee: "连接后查看连接",
-    noProfiles: "无保存配置", addProfile: "添加密钥",
+    system: "系统",
+    addProfile: "添加密钥",
     keysSection: "密钥", noKeys: "没有已保存的密钥或订阅",
-    pasteFromClipboard: "从剪贴板粘贴", scanQr: "扫描二维码", qrScanFailed: "二维码扫描失败", pasteJson: "从文件导入 JSON", copyJson: "复制 JSON",
-    shareQr: "通过二维码分享", shareQrHint: "在另一台设备上：+ → 扫描二维码", shareQrReveal: "点击显示",
+    pasteFromClipboard: "从剪贴板粘贴", qrScanFailed: "二维码扫描失败", pasteJson: "从文件导入 JSON", copyJson: "复制 JSON",
+    qrCode: "二维码", qrTabShare: "分享", qrTabScan: "扫描", qrScanHint: "将相机对准二维码", shareQrHint: "在另一台设备上：+ → 二维码 → 扫描",
     shareQrWarning: "看到此二维码的人即可使用您的密钥", shareQrTooLong: "超出二维码最大长度，请使用“复制”",
-    nothingToShare: "没有可分享的密钥或订阅", shareKindKey: "密钥", shareKindSub: "订阅", close: "关闭",
-    jsonData: "JSON", jsonParseError: "JSON 格式无效", jsonImported: "已导入条目：", jsonCopied: "JSON 已复制到剪贴板",
-    clipboardEmpty: "剪贴板为空", clipboardReadFailed: "读取剪贴板失败", clipboardWriteFailed: "复制到剪贴板失败",
+    nothingToShare: "没有可用的密钥", shareKindKey: "密钥", shareKindSub: "订阅", close: "关闭",
+    jsonParseError: "JSON 格式无效", jsonImported: "已导入条目：", jsonCopied: "JSON 已复制到剪贴板",
+    clipboardReadFailed: "读取剪贴板失败", clipboardWriteFailed: "复制到剪贴板失败",
     pasteUnrecognized: "无法识别内容。需要 whispera:// 密钥或 https:// 链接",
     refreshAllSubs: "更新订阅", subsRefreshedSummary: "已更新订阅：",
     subAutoUpdateOn: "自动更新：开", subAutoUpdateOff: "自动更新：关",
@@ -490,30 +328,24 @@ const i18n: Record<Lang, Record<string, string>> = {
     mixedPort: "混合端口", bindAddr: "绑定地址", tunStack: "Tun堆栈", shareProxy: "共享代理",
     theme: "主题", dark: "深色", auto: "浅色", dnsRedirect: "DNS重定向",
     ipv6Label: "IPv6", secretLabel: "密钥", copy: "复制",
-    autostart: "自动启动", externalLink: "外部配置", externalHint: "vless:// trojan:// ss:// 链接 — 由 mihomo 承载隧道，本客户端不启动。留空 = 使用自有协议", authTip: "认证提示",
+    ipv6FallbackLabel: "服务器 IPv4 被封时改用 IPv6", ipv6OnlyLabel: "仅通过 IPv6 连接服务器",
+    autostart: "自动启动",
     config: "配置", open: "打开", update: "更新",
     openRepo: "打开仓库", checkUpdates: "检查更新", checking: "检查中",
     installed: "已安装最新版本",
     profileName: "配置名称", profileKey: "连接密钥",
     save: "保存", cancel: "取消",
     mihomo: "MIHOMO", whisp: "WHISP",
-    tunnel: "隧道", server: "服务器", duration: "时长",
-    proxy: "代理", port: "端口", notSet: "未设置",
-    clearLogs: "清空", active: "活跃", inactive: "非活跃",
-    connecting: "连接中...", disconnecting: "断开中...",
+    clearLogs: "清空", active: "活跃",
+    connecting: "连接中...",
+    fail_network_down: "没有网络：连国内的检测地址也无响应", fail_foreign_cut: "只有国内网络可用：国外地址无法访问", fail_server_unreachable: "服务器无响应，但其他网络正常：其 IP 被封锁或服务器已关闭", fail_server_refused: "服务器拒绝连接：其服务未运行", fail_handshake_blocked: "连接在途中被阻断", fail_live_blocked: "连接在传输数据时被切断", wire_forged_reset: "伪造的重置 (RST)", wire_hello_dropped: "TLS 握手消息无法送达", wire_cut_off: "握手中途被切断", wire_retransmitted: "数据包丢失", failFreezeAt: "{kb} KB 后被冻结", failNewPattern: "训练中未见过的封锁类型", failWhileConnected: "新连接无法建立",
     killSwitch: "终止开关",
-    routingTitle: "路由", routingDesc: "指定直连或经代理的应用或网站",
-    addSite: "添加网站", addApp: "选择应用", domain: "域名", app: "应用",
-    routeDirect: "直连", routeProxy: "Proxy", noRules: "无规则",
-    domainHint: "例如：steampowered.com",
-    blocklist: "黑名单", blocklistTitle: "黑名单", blocklistDesc: "已拦截域名和应用",
-    blockDomain: "拦截域名", blockApp: "拦截应用", blockKeyword: "按关键词", blockIp: "拦截IP/CIDR",
-    noBlocked: "列表为空", blocked: "已拦截", domainBlockHint: "例如：tiktok.com",
-    keywordHint: "例如：tracker", ipHint: "例如：1.2.3.0/24",
-    subscriptions: "订阅", addSubscription: "添加订阅",
+    routingTitle: "路由",
+    domain: "域名", app: "应用",
+    addSubscription: "添加订阅",
     subName: "名称", subUrl: "订阅URL", keyJson: "查看 JSON", keyJsonTitle: "密钥配置", keyJsonForeign: "外部协议 — 仅查看", keyJsonBad: "无法解析密钥", keyJsonSaved: "密钥已更新", subUrlHint: "https://server/sub/TOKEN",
-    noSubscriptions: "无订阅", subKeys: "密钥", subRefreshing: "更新中...", subAdded: "订阅已添加",
-    subRefresh: "刷新", subDelete: "删除", subLastUpdated: "已更新",
+    noSubscriptions: "无订阅", subRefreshing: "更新中...", subAdded: "订阅已添加",
+    subRefresh: "刷新", subDelete: "删除",
     subSelectKey: "使用密钥", subRename: "重命名", more: "更多",
     pingWhileOn: "仅在断开连接时可测量", pingKey: "延迟", pingAll: "全部延迟", pingMs: "毫秒", pingTimeout: "超时", pingError: "错误", pingRunning: "...",
     loading: "加载中…",
@@ -521,67 +353,16 @@ const i18n: Record<Lang, Record<string, string>> = {
     vpnConnected: "已连接",
     switchingKey: "正在切换密钥...", pleaseWait: "请稍候，正在切换...",
     vpnDisconnected: "已断开",
-    muxOn: "MUX已开启",
-    muxOff: "MUX已关闭",
-    muxEnabled: "MUX已开启",
-    muxDisabled: "MUX已关闭",
-    connClosed: "连接已关闭",
-    bridgeUpdated: "桥接已更新",
-    speedUpdated: "速度已更新",
-    portUpdated: "端口已更新",
-    noRecommendation: "无推荐",
-    noActiveConns: "无活跃连接",
-    agentTransport: "传输代理",
-    agentNotRunning: "代理未运行",
-    agentTransportUCB: "传输代理 (UCB)",
-    agentState: "状态",
-    agentProbesRotations: "探测/轮换次数",
-    agentQValues: "传输Q值",
-    agentApply: "应用推荐",
-    agentRefresh: "刷新",
-    agentIdle: "空闲",
-    agentProbing: "探测中",
-    agentRotating: "轮换中",
-    agentConnected: "已连接",
-    agentBlocked: "已封锁",
-    agentNoData: "无数据",
-    connCountLabel: "连接数",
-    connNoActive: "无活跃连接",
-    connKeyEncrypted: "已加密",
-    connStatusActive: "活跃",
-    connStatusConnecting: "连接中",
-    connStatusFailed: "失败",
-    connStatusOff: "关闭",
-    connMuxTitle: "多路复用",
-    connDuplicate: "复制",
-    connDup: "已复制",
-    connClose: "关闭连接",
-    connApply: "应用",
-    connPort: "端口",
-    connBridge: "桥接",
-    connSpeed: "速度 KB/s",
-    connObfs: "混淆（诱饵）",
-    connTransportSecureTitle: "开启时 — 信任传输层内置加密（TLS/QUIC），跳过双重混淆。默认关闭 — 混淆始终叠加在任何传输之上以防御DPI。",
-    connMarionetteTitle: "Marionette模拟即时通讯流量行为——流量模式、时序、数据包大小。选择与实际使用最接近的配置文件。神经网络可以自动切换配置文件。",
-    connTransportSecureOn: "Transport Secure 开启 — 双重混淆已禁用",
-    connTransportSecureOff: "Transport Secure 关闭 — 混淆始终启用",
-    marionetteDisabled: "Marionette已禁用",
-    profileNone: "— 无 —",
-    profileMusicSep: "── 音乐 ──",
-    profileVideoSep: "── 视频 ──",
-    fpRandom: "随机",
-    fpBrowser: "浏览器",
-    fpApplyNow: "立即应用",
     ruleBlock: "拦截",
     ruleDirect: "直连",
-    ruleSite: "站点",
+    ruleSite: "域名",
     ruleKeyword: "关键词",
     ruleApp: "应用",
     ruleNoRules: "无规则",
     ruleViaVpn: "Proxy",
     ruleDirect2: "直连",
     ruleAdd: "添加规则",
-    ruleSiteType: "站点",
+    ruleSiteType: "域名",
     ruleAppType: "应用",
     ruleKeywordType: "关键词",
     rulePlaceholder: "例如：youtube.com",
@@ -597,83 +378,57 @@ const i18n: Record<Lang, Record<string, string>> = {
     subUpdateAvailableToast: "订阅有可用更新",
     subUpdateFailed: "更新失败",
     secretCopied: "Secret已复制",
-    updateAvailable: "已是最新版本",
-    updateCheckFailed: "检查更新失败",
     reconnectToApply: "重新连接后更改将生效",
-    dnsServers: "DNS服务器",
-    dnsCommaSep: "逗号分隔，留空=默认",
-    vpnDns: "代理 DNS（客户端）",
-    vpnDnsHint: "代理客户端DNS。'运营商'=系统解析器",
+    dnsServers: "直连 DNS",
+    dnsCommaSep: "默认为空",
+    vpnDns: "设置 DNS：",
     dnsMode: "DNS 模式",
     dnsStrategy: "DNS 解析器",
     dnsFakeip: "虚假 IP",
     dnsLocal: "本地",
-    dnsStrategyHint: "虚假IP — 域名在隧道内解析，运营商看不到真实IP。本地 — 使用设备系统解析器。",
     killSwitchLabel: "断网保护",
-    killSwitchOn: "系统已阻止无VPN的连接",
-    killSwitchOff: "未阻止无VPN的连接",
     killSwitchOpen: "系统设置",
+    modeProxy: "代理",
     tunStackLabel: "网络栈",
-    tunStackHint: "gVisor — 用户态网络栈，兼容性最好。System — 更快，但在未root的安卓上不支持IPv6。Mixed — TCP走系统栈，UDP走gVisor。",
     quicLabel: "允许 QUIC",
-    quicHint: "使用TCP传输时，QUIC在隧道内跑在TCP之上——可靠信道上再叠加一层拥塞控制和重传。关闭后拒绝QUIC，应用会直接改用TCP，通常更快。",
     pingModeLabel: "检测方式",
-    pingModeHint: "TCP — 建立连接的时间。GET 和 HEAD — 完整HTTP请求，更接近真实加载。ICMP不走隧道：本协议只承载TCP和UDP。",
     mtuLabel: "MTU",
-    mtuHint: "TUN 接口的 MTU 大小（576–9000，默认 1500）",
     tlsFragment: "TLS 分片",
-    tlsFragmentHint: "将 TLS ClientHello 拆分为多个 TCP 分段，使 DPI 无法读取完整 SNI",
     isp: "运营商",
+    dnsService: "服务", dnsPrimary: "主要", dnsSecondary: "备用", dnsCustom: "自定义", dnsCustomHint: "IP 或 https://…",
     bypassMode: "绕过模式",
     bypassModeHint: "GeoIP 和您所在国家/地区的域名将自动直连。",
     advanced: "高级",
     allowLan: "允许 LAN",
     allowLanHint: "局域网其他设备可使用此代理",
-    logLevel: "日志级别",
     routingMode: "路由模式",
     socksAuth: "SOCKS5 认证",
     socksUser: "用户名",
     socksPass: "密码",
-    socksProxyUrl: "代理 URL",
-    socksAuthHint: "留空则端口无需密码",
     socksShow: "显示密码",
     socksHide: "隐藏密码",
     socksSave: "保存",
     reconnectRequired: "重连以应用规则",
     logSearchPlaceholder: "搜索日志...",
     logAll: "全部",
-    transportSet: "传输 →",
-    duplicated: "已复制",
-    duplicatedTo: "已复制 →",
-    profileSet: "配置:",
-    fingerprintSet: "指纹:",
-    analysisDone: "分析完成 — DPI风险:",
-    foundPorts: "找到",
-    openPorts: "个开放端口",
-    versionAvail: "可用版本:",
     updateAvailableNew: "有可用更新",
-    upToDate: "已是最新版本",
     installUpdate: "安装",
     openRelease: "打开发布",
     currentVersion: "当前版本",
-    latestVersion: "最新版本",
-    releaseNotes: "发布说明",
   },
   fa: {
-    home: "خانه", profiles: "پروفایل‌ها", routing: "مسیریابی", logs: "گزارش", settings: "تنظیمات",
+    home: "خانه", routing: "مسیریابی", logs: "گزارش", settings: "تنظیمات",
     disconnected: "قطع شده", connected: "متصل",
     keyPlaceholder: "کلید را وارد کنید...", noKeySelected: "بدون کلید", connect: "اتصال", disconnect: "قطع",
-    ipInfo: "اطلاعات IP", ipAddress: "آدرس IP", location: "موقعیت", provider: "ارائه‌دهنده",
-    system: "سیستم", os: "سیستم‌عامل", uptime: "مدت اجرا", version: "نسخه", admin: "مدیر",
-    activeConns: "اتصالات فعال", connectToSee: "برای مشاهده متصل شوید",
-    noProfiles: "پروفایلی ذخیره نشده", addProfile: "افزودن کلید",
+    system: "سیستم",
+    addProfile: "افزودن کلید",
     keysSection: "کلیدها", noKeys: "کلید یا اشتراکی ذخیره نشده",
-    pasteFromClipboard: "جای‌گذاری از کلیپ‌بورد", scanQr: "اسکن کد QR", qrScanFailed: "اسکن کد QR ناموفق بود", pasteJson: "وارد کردن JSON از فایل", copyJson: "کپی JSON",
-    shareQr: "اشتراک‌گذاری با کد QR", shareQrHint: "در دستگاه دیگر: + ← اسکن کد QR", shareQrReveal: "برای نمایش ضربه بزنید",
+    pasteFromClipboard: "جای‌گذاری از کلیپ‌بورد", qrScanFailed: "اسکن کد QR ناموفق بود", pasteJson: "وارد کردن JSON از فایل", copyJson: "کپی JSON",
+    qrCode: "کد QR", qrTabShare: "اشتراک‌گذاری", qrTabScan: "اسکن", qrScanHint: "دوربین را به سمت کد QR بگیرید", shareQrHint: "در دستگاه دیگر: + ← کد QR ← اسکن",
     shareQrWarning: "هر کسی این کد را ببیند به کلید شما دسترسی پیدا می‌کند", shareQrTooLong: "از حداکثر طول کد QR بیشتر است. از «کپی» استفاده کنید",
-    nothingToShare: "کلید یا اشتراکی برای اشتراک‌گذاری وجود ندارد", shareKindKey: "کلید", shareKindSub: "اشتراک", close: "بستن",
-    jsonData: "JSON", jsonParseError: "JSON نامعتبر", jsonImported: "موارد وارد شده:", jsonCopied: "JSON در کلیپ‌بورد کپی شد",
-    clipboardEmpty: "کلیپ‌بورد خالی است", clipboardReadFailed: "خواندن کلیپ‌بورد ناموفق بود", clipboardWriteFailed: "کپی در کلیپ‌بورد ناموفق بود",
+    nothingToShare: "کلیدی در دسترس نیست", shareKindKey: "کلید", shareKindSub: "اشتراک", close: "بستن",
+    jsonParseError: "JSON نامعتبر", jsonImported: "موارد وارد شده:", jsonCopied: "JSON در کلیپ‌بورد کپی شد",
+    clipboardReadFailed: "خواندن کلیپ‌بورد ناموفق بود", clipboardWriteFailed: "کپی در کلیپ‌بورد ناموفق بود",
     pasteUnrecognized: "محتوا شناسایی نشد. کلید whispera:// یا لینک https:// مورد نیاز است",
     refreshAllSubs: "به‌روزرسانی اشتراک‌ها", subsRefreshedSummary: "اشتراک‌های به‌روزشده:",
     subAutoUpdateOn: "به‌روزرسانی خودکار: روشن", subAutoUpdateOff: "به‌روزرسانی خودکار: خاموش",
@@ -681,30 +436,24 @@ const i18n: Record<Lang, Record<string, string>> = {
     mixedPort: "پورت ترکیبی", bindAddr: "آدرس bind", tunStack: "Tun Stack", shareProxy: "اشتراک پراکسی",
     theme: "پوسته", dark: "تیره", auto: "روشن", dnsRedirect: "هدایت DNS",
     ipv6Label: "IPv6", secretLabel: "رمز", copy: "کپی",
-    autostart: "شروع خودکار", externalLink: "پروفایل خارجی", externalHint: "لینک vless:// trojan:// ss:// — تونل با mihomo، کلاینت ما اجرا نمی‌شود. خالی = پروتکل خودی", authTip: "راهنمای احراز هویت",
+    ipv6FallbackLabel: "IPv6 در صورت مسدود بودن IPv4 سرور", ipv6OnlyLabel: "اتصال به سرور فقط با IPv6",
+    autostart: "شروع خودکار",
     config: "پیکربندی", open: "باز کردن", update: "بروزرسانی",
     openRepo: "باز کردن مخزن", checkUpdates: "بررسی بروزرسانی", checking: "در حال بررسی",
     installed: "نسخه به‌روز است",
     profileName: "نام پروفایل", profileKey: "کلید اتصال",
     save: "ذخیره", cancel: "لغو",
     mihomo: "MIHOMO", whisp: "WHISP",
-    tunnel: "تونل", server: "سرور", duration: "مدت",
-    proxy: "پراکسی", port: "پورت", notSet: "تنظیم نشده",
-    clearLogs: "پاک کردن", active: "فعال", inactive: "غیرفعال",
-    connecting: "در حال اتصال...", disconnecting: "در حال قطع...",
+    clearLogs: "پاک کردن", active: "فعال",
+    connecting: "در حال اتصال...",
+    fail_network_down: "اینترنت وصل نیست: حتی نشانی داخلی هم پاسخ نمی‌دهد", fail_foreign_cut: "فقط اینترنت داخلی کار می‌کند: نشانی‌های خارجی در دسترس نیستند", fail_server_unreachable: "سرور پاسخ نمی‌دهد در حالی که بقیه اینترنت کار می‌کند: IP آن مسدود است یا سرور خاموش است", fail_server_refused: "سرور اتصال را رد می‌کند: سرویس آن اجرا نمی‌شود", fail_handshake_blocked: "اتصال در مسیر مسدود می‌شود", fail_live_blocked: "اتصال‌ها هنگام انتقال داده قطع می‌شوند", wire_forged_reset: "بازنشانی جعلی (RST)", wire_hello_dropped: "پیام آغازین TLS نمی‌رسد", wire_cut_off: "قطع در میانه دست‌دهی", wire_retransmitted: "بسته‌ها گم می‌شوند", failFreezeAt: "توقف پس از {kb} کیلوبایت", failNewPattern: "نوعی مسدودسازی که در آموزش دیده نشده", failWhileConnected: "اتصال‌های جدید برقرار نمی‌شوند",
     killSwitch: "Kill Switch",
-    routingTitle: "مسیریابی", routingDesc: "برنامه‌ها یا سایت‌هایی که مستقیم یا از طریق پراکسی هستند را مشخص کنید",
-    addSite: "افزودن سایت", addApp: "انتخاب برنامه", domain: "دامنه", app: "برنامه",
-    routeDirect: "مستقیم", routeProxy: "Proxy", noRules: "قانونی اضافه نشده",
-    domainHint: "مثلاً: steampowered.com",
-    blocklist: "لیست سیاه", blocklistTitle: "لیست سیاه", blocklistDesc: "دامنه‌ها و برنامه‌های مسدود شده",
-    blockDomain: "مسدود کردن دامنه", blockApp: "مسدود کردن برنامه", blockKeyword: "بر اساس کلیدواژه", blockIp: "مسدود کردن IP/CIDR",
-    noBlocked: "لیست خالی است", blocked: "مسدود شده", domainBlockHint: "مثلاً: tiktok.com",
-    keywordHint: "مثلاً: tracker", ipHint: "مثلاً: 1.2.3.0/24",
-    subscriptions: "اشتراک‌ها", addSubscription: "افزودن اشتراک",
+    routingTitle: "مسیریابی",
+    domain: "دامنه", app: "برنامه",
+    addSubscription: "افزودن اشتراک",
     subName: "نام", subUrl: "URL اشتراک", keyJson: "نمایش JSON", keyJsonTitle: "پیکربندی کلید", keyJsonForeign: "پروتکل خارجی — فقط مشاهده", keyJsonBad: "کلید قابل تجزیه نیست", keyJsonSaved: "کلید به‌روزرسانی شد", subUrlHint: "https://server/sub/TOKEN",
-    noSubscriptions: "اشتراکی وجود ندارد", subKeys: "کلیدها", subRefreshing: "در حال بروزرسانی...", subAdded: "اشتراک اضافه شد",
-    subRefresh: "بروزرسانی", subDelete: "حذف", subLastUpdated: "بروزرسانی شده",
+    noSubscriptions: "اشتراکی وجود ندارد", subRefreshing: "در حال بروزرسانی...", subAdded: "اشتراک اضافه شد",
+    subRefresh: "بروزرسانی", subDelete: "حذف",
     subSelectKey: "استفاده از کلید", subRename: "تغییر نام", more: "بیشتر",
     pingWhileOn: "اندازه‌گیری فقط در حالت قطع", pingKey: "پینگ", pingAll: "پینگ همه", pingMs: "میلی‌ثانیه", pingTimeout: "تایم‌اوت", pingError: "خطا", pingRunning: "...",
     loading: "در حال بارگذاری…",
@@ -712,67 +461,16 @@ const i18n: Record<Lang, Record<string, string>> = {
     vpnConnected: "متصل شد",
     switchingKey: "در حال تعویض کلید...", pleaseWait: "لطفاً صبر کنید، در حال تعویض...",
     vpnDisconnected: "قطع شد",
-    muxOn: "MUX روشن شد",
-    muxOff: "MUX خاموش شد",
-    muxEnabled: "MUX فعال شد",
-    muxDisabled: "MUX غیرفعال شد",
-    connClosed: "اتصال بسته شد",
-    bridgeUpdated: "پل به‌روز شد",
-    speedUpdated: "سرعت به‌روز شد",
-    portUpdated: "پورت به‌روز شد",
-    noRecommendation: "توصیه‌ای وجود ندارد",
-    noActiveConns: "اتصال فعالی وجود ندارد",
-    agentTransport: "عامل انتقال",
-    agentNotRunning: "عامل در حال اجرا نیست",
-    agentTransportUCB: "عامل انتقال (UCB)",
-    agentState: "وضعیت",
-    agentProbesRotations: "تعداد بررسی / چرخش",
-    agentQValues: "مقادیر Q انتقال",
-    agentApply: "اعمال توصیه",
-    agentRefresh: "بروزرسانی",
-    agentIdle: "بیکار",
-    agentProbing: "در حال بررسی",
-    agentRotating: "در حال چرخش",
-    agentConnected: "متصل",
-    agentBlocked: "مسدود",
-    agentNoData: "بدون داده",
-    connCountLabel: "تعداد اتصالات",
-    connNoActive: "اتصال فعالی وجود ندارد",
-    connKeyEncrypted: "رمزنگاری شده",
-    connStatusActive: "فعال",
-    connStatusConnecting: "در حال اتصال",
-    connStatusFailed: "ناموفق",
-    connStatusOff: "خاموش",
-    connMuxTitle: "مالتی‌پلکسینگ",
-    connDuplicate: "تکرار",
-    connDup: "تکرار شد",
-    connClose: "بستن اتصال",
-    connApply: "اعمال",
-    connPort: "پورت",
-    connBridge: "پل",
-    connSpeed: "سرعت KB/s",
-    connObfs: "مبهم‌سازی (طعمه)",
-    connTransportSecureTitle: "وقتی روشن است — به رمزنگاری داخلی انتقال (TLS/QUIC) اعتماد می‌کند و مبهم‌سازی مضاعف را رد می‌کند. پیش‌فرض خاموش — مبهم‌سازی همیشه روی هر انتقال اعمال می‌شود.",
-    connMarionetteTitle: "Marionette رفتار ترافیک پیام‌رسان را شبیه‌سازی می‌کند — الگوها، زمان‌بندی، اندازه بسته‌ها. پروفایلی نزدیک به استفاده واقعی انتخاب کنید. شبکه عصبی می‌تواند پروفایل را خودکار تغییر دهد.",
-    connTransportSecureOn: "Transport Secure روشن — مبهم‌سازی مضاعف غیرفعال شد",
-    connTransportSecureOff: "Transport Secure خاموش — مبهم‌سازی همیشه فعال است",
-    marionetteDisabled: "Marionette غیرفعال شد",
-    profileNone: "— هیچ —",
-    profileMusicSep: "── موسیقی ──",
-    profileVideoSep: "── ویدیو ──",
-    fpRandom: "تصادفی",
-    fpBrowser: "مرورگر",
-    fpApplyNow: "اعمال",
     ruleBlock: "مسدود",
     ruleDirect: "مستقیم",
-    ruleSite: "سایت",
+    ruleSite: "دامنه",
     ruleKeyword: "کلیدواژه",
     ruleApp: "برنامه",
     ruleNoRules: "قانونی وجود ندارد",
     ruleViaVpn: "Proxy",
     ruleDirect2: "مستقیم",
     ruleAdd: "افزودن قانون",
-    ruleSiteType: "سایت",
+    ruleSiteType: "دامنه",
     ruleAppType: "برنامه",
     ruleKeywordType: "کلیدواژه",
     rulePlaceholder: "مثلاً: youtube.com",
@@ -788,67 +486,43 @@ const i18n: Record<Lang, Record<string, string>> = {
     subUpdateAvailableToast: "بروزرسانی اشتراک موجود است",
     subUpdateFailed: "به‌روزرسانی ناموفق",
     secretCopied: "Secret کپی شد",
-    updateAvailable: "نسخه به‌روز نصب است",
-    updateCheckFailed: "بررسی به‌روزرسانی ناموفق",
     reconnectToApply: "تغییر پس از اتصال مجدد اعمال خواهد شد",
-    dnsServers: "سرورهای DNS",
-    dnsCommaSep: "جداشده با کاما، خالی = پیش‌فرض",
-    vpnDns: "Proxy DNS (کلاینت)",
-    vpnDnsHint: "DNS برای کلاینت پراکسی. 'ISP' = رزولور سیستم",
+    dnsServers: "DNS اتصال مستقیم",
+    dnsCommaSep: "به‌طور پیش‌فرض خالی",
+    vpnDns: "DNS خود را تنظیم کنید:",
     dnsMode: "حالت DNS",
     dnsStrategy: "رزولور DNS",
     dnsFakeip: "جعلی (Fake-IP)",
     dnsLocal: "محلی",
-    dnsStrategyHint: "جعلی (fake-IP) — دامنه‌ها داخل تونل حل می‌شوند و IP از ISP پنهان است. محلی — رزولور سیستم دستگاه.",
     killSwitchLabel: "قطع‌کن اضطراری",
-    killSwitchOn: "سیستم اتصال‌های بدون VPN را مسدود می‌کند",
-    killSwitchOff: "اتصال‌های بدون VPN مسدود نیستند",
     killSwitchOpen: "تنظیمات سیستم",
+    modeProxy: "پراکسی",
     tunStackLabel: "پشته شبکه",
-    tunStackHint: "gVisor — پشته در فضای کاربر، همه‌جا کار می‌کند. System — سریع‌تر، اما در اندروید بدون روت IPv6 ندارد.",
     quicLabel: "اجازه QUIC",
-    quicHint: "با ترابری TCP، کیوآیک داخل تونل روی TCP می‌رود — کنترل ازدحام و ارسال مجدد روی کانالی که خودش قابل‌اطمینان است. خاموش: QUIC رد می‌شود و برنامه مستقیم TCP می‌گیرد، معمولاً سریع‌تر.",
     pingModeLabel: "روش بررسی",
-    pingModeHint: "TCP — زمان برقراری اتصال. GET و HEAD — درخواست کامل HTTP، نزدیک‌تر به بارگذاری واقعی. ICMP از تونل عبور نمی‌کند: پروتکل ما فقط TCP و UDP را حمل می‌کند.",
     mtuLabel: "MTU",
-    mtuHint: "اندازه MTU برای رابط TUN (۵۷۶–۹۰۰۰، پیش‌فرض ۱۵۰۰)",
     tlsFragment: "قطعه‌قطعه‌سازی TLS",
-    tlsFragmentHint: "ClientHello در TLS را به چند بخش TCP تقسیم می‌کند تا DPI نتواند کل SNI را بخواند",
     isp: "ISP",
+    dnsService: "سرویس", dnsPrimary: "اصلی", dnsSecondary: "پشتیبان", dnsCustom: "سفارشی", dnsCustomHint: "IP یا https://…",
     bypassMode: "حالت دور زدن",
     bypassModeHint: "GeoIP و دامنه‌های کشور شما به‌طور خودکار مستقیم مسیردهی می‌شوند.",
     advanced: "پیشرفته",
     allowLan: "اجازه LAN",
     allowLanHint: "سایر دستگاه‌های شبکه می‌توانند از این پروکسی استفاده کنند",
-    logLevel: "سطح لاگ",
     routingMode: "حالت مسیریابی",
     socksAuth: "احراز هویت SOCKS5",
     socksUser: "نام کاربری",
     socksPass: "رمز عبور",
-    socksProxyUrl: "آدرس پروکسی",
-    socksAuthHint: "خالی یعنی پورت بدون رمز باز است",
     socksShow: "نمایش رمز",
     socksHide: "پنهان کردن رمز",
     socksSave: "ذخیره",
     reconnectRequired: "برای اعمال قانون دوباره متصل شوید",
     logSearchPlaceholder: "جستجو در گزارش‌ها...",
     logAll: "همه",
-    transportSet: "انتقال →",
-    duplicated: "کپی شد",
-    duplicatedTo: "کپی شد →",
-    profileSet: "پروفایل:",
-    fingerprintSet: "اثر انگشت:",
-    analysisDone: "تحلیل انجام شد — خطر DPI:",
-    foundPorts: "یافت شد",
-    openPorts: "پورت باز",
-    versionAvail: "نسخه موجود:",
     updateAvailableNew: "به‌روزرسانی موجود است",
-    upToDate: "به‌روز است",
     installUpdate: "نصب",
     openRelease: "باز کردن انتشار",
     currentVersion: "نسخه فعلی",
-    latestVersion: "آخرین نسخه",
-    releaseNotes: "یادداشت‌های انتشار",
   },
 };
 
@@ -859,12 +533,16 @@ let isConnected = false;
 // traffic. Reconnecting keys off this one: a tunnel that is briefly down
 // recovers on its own, and tearing the engines down would interrupt that.
 let enginesUp = false;
+interface TunnelFailure { cause: string; symptom?: string; wire?: string; pattern?: number; down_bytes?: number; failures?: number }
+const WARN_AFTER_FAILED_DIALS = 2;
+let tunnelFailure: TunnelFailure | null = null;
 let lastTunnelError = "";
 let isConnecting = false;
 
 
 
 const isAndroid = /android/i.test(navigator.userAgent);
+const isWindows = /windows/i.test(navigator.userAgent);
 
 let _notifGranted = false;
 async function initNotifications(): Promise<void> {
@@ -885,7 +563,7 @@ let settings: AppSettings = {
   conn_key: "", auto_connect: false, theme: "dark", mihomo_port: 9887,
   socks_addr: "127.0.0.1", kill_switch: false, dns_redirect: false,
   ipv6: true, tun_stack: "Mixed", tun_stack_android: "gvisor", quic: false, ping_mode: "tcp", hwid: true, auth_tip: true, secret: "",
-  dns_strategy: "fakeip", mtu: 1500, tls_fragment: false, sub_auto_update: true,
+  dns_strategy: "fakeip", mtu: 1500, tls_fragment: false, sub_auto_update: true, proxy_mode: "tun",
 };
 
 let profiles: Profile[] = [];
@@ -1013,7 +691,8 @@ function stopSubAutoCheck(): void {
   if (subAutoCheckTimer) { clearInterval(subAutoCheckTimer); subAutoCheckTimer = null; }
 }
 function loadLang(): void { const s = localStorage.getItem("whisp_lang"); if (s === "en" || s === "ru" || s === "zh" || s === "fa") lang = s as Lang; }
-function saveLang(): void { localStorage.setItem("whisp_lang", lang); }
+function syncNativeLang(): void { if (isAndroid) void invoke("set_app_language", { lang }).catch(() => {}); }
+function saveLang(): void { localStorage.setItem("whisp_lang", lang); syncNativeLang(); }
 
 /* ===================== BACKEND ===================== */
 async function loadSettings(): Promise<void> {
@@ -1128,8 +807,11 @@ async function checkStatus(): Promise<boolean> {
     const was = isConnected;
     enginesUp = await invoke<boolean>("get_status");
     isConnected = enginesUp;
+    let tunnelSince = NaN;
+    if (!enginesUp) tunnelFailure = null;
     if (enginesUp) {
-      const t = await invoke<{ known: boolean; up: boolean; error: string | null }>("get_tunnel_state");
+      const t = await invoke<{ known: boolean; up: boolean; error: string | null; failure: TunnelFailure | null; connected_at: string | null }>("get_tunnel_state");
+      tunnelFailure = t.known ? t.failure : null;
       if (t.known && !t.up) {
         isConnected = false;
         if (t.error && t.error !== lastTunnelError) {
@@ -1138,11 +820,12 @@ async function checkStatus(): Promise<boolean> {
         }
       } else if (t.up) {
         lastTunnelError = "";
+        if (t.connected_at) tunnelSince = Date.parse(t.connected_at);
       }
     }
     if (isConnected && !was && connectTime === null) {
       const saved = parseInt(localStorage.getItem("connectTime") || "", 10);
-      connectTime = Number.isFinite(saved) && saved > 0 ? saved : Date.now();
+      connectTime = Number.isFinite(tunnelSince) ? tunnelSince : Number.isFinite(saved) && saved > 0 ? saved : Date.now();
     }
     return true;
   } catch {
@@ -1277,7 +960,10 @@ function renderShell(): void {
   app.innerHTML = `
     <header class="top-bar" id="top-bar">
       <span class="logo-wordmark">whisp</span>
-      <div class="lang-switcher" id="lang-sw"></div>
+      <div class="top-switchers">
+        <div class="lang-switcher mode-switcher" id="mode-sw"${isWindows ? "" : " hidden"}></div>
+        <div class="lang-switcher" id="lang-sw"></div>
+      </div>
     </header>
     <div class="main-content" id="main-content"></div>
     <nav class="bottom-nav" id="bottom-nav"></nav>
@@ -1334,6 +1020,26 @@ function renderNav(): void {
   document.querySelectorAll<HTMLElement>(".lang-btn[data-lang]").forEach(el => {
     el.addEventListener("click", () => { lang = el.dataset.lang as Lang; saveLang(); renderNav(); renderPage(); });
   });
+  renderModeSwitch();
+}
+
+function renderModeSwitch(): void {
+  const modeSw = document.getElementById("mode-sw");
+  if (!modeSw || !isWindows) return;
+  const mode = settings.proxy_mode === "system" ? "system" : "tun";
+  modeSw.innerHTML = `
+    <button class="lang-btn ${mode === "tun" ? "active" : ""}" data-mode="tun">TUN</button>
+    <button class="lang-btn ${mode === "system" ? "active" : ""}" data-mode="system">${t("modeProxy")}</button>
+  `;
+  modeSw.querySelectorAll<HTMLElement>(".lang-btn[data-mode]").forEach(el => {
+    el.addEventListener("click", async () => {
+      if (isConnecting || el.dataset.mode === mode) return;
+      settings.proxy_mode = el.dataset.mode;
+      renderModeSwitch();
+      await persistSettings();
+      if (isConnected) await doConnect();
+    });
+  });
 }
 
 function renderPage(): void {
@@ -1388,6 +1094,8 @@ function updateHome(): void {
     renderPage();
     return;
   }
+  const failure = document.getElementById("status-failure");
+  if (failure) failure.textContent = failureText();
 }
 
 function showToast(msg: string, type: "success" | "error" | "info" = "info", duration = 3500): void {
@@ -1410,6 +1118,17 @@ function tickUptime(): void {
   if (el) el.textContent = isConnected && connectTime ? formatDuration(Date.now() - connectTime) : "";
   const el2 = document.getElementById("conn-uptime");
   if (el2) el2.textContent = isConnected && connectTime ? formatDuration(Date.now() - connectTime) : "—";
+}
+
+function failureText(): string {
+  const f = tunnelFailure;
+  if (!enginesUp || !f) return "";
+  if (isConnected && (f.failures ?? 0) < WARN_AFTER_FAILED_DIALS) return "";
+  const parts = [isConnected ? `${t("failWhileConnected")}: ${t(`fail_${f.cause}`)}` : t(`fail_${f.cause}`)];
+  if (f.wire && f.wire !== "none") parts.push(t(`wire_${f.wire}`));
+  if (f.symptom === "stall_volume" && f.down_bytes) parts.push(t("failFreezeAt").replace("{kb}", String(Math.round(f.down_bytes / 1024))));
+  if (f.pattern) parts.push(t("failNewPattern"));
+  return parts.join(" · ");
 }
 
 function hasUsableKey(): boolean {
@@ -1442,6 +1161,7 @@ function renderHome(): string {
     </div>
     <div class="power-status">
       <div class="status-text">${dis ? t("connecting") : isConnected ? t("connected") : noKey ? t("noKeySelected") : t("disconnected")}</div>
+      <div class="status-failure" id="status-failure">${esc(failureText())}</div>
       ${isConnected ? `<div class="status-server">${profileName ? esc(profileName) + " · " : ""}${serverHost ? esc(serverHost) + " · " : ""}<span id="status-uptime">${uptimeStr}</span></div>` : ""}
     </div>`;
 
@@ -1458,10 +1178,9 @@ function renderHome(): string {
           <button class="km-item" id="btn-add-key-single">${ICONS.user}<span>${t("addProfile")}</span></button>
           <button class="km-item" id="btn-add-key-sub">${ICONS.link}<span>${t("addSubscription")}</span></button>
           <button class="km-item" id="btn-add-key-paste">${ICONS.clipboard}<span>${t("pasteFromClipboard")}</span></button>
-          ${isAndroid ? `<button class="km-item" id="btn-add-key-qr">${ICONS.qr}<span>${t("scanQr")}</span></button>` : ""}
+          <button class="km-item" id="btn-qr">${ICONS.qr}<span>${t("qrCode")}</span></button>
           <button class="km-item" id="btn-add-key-import-json">${ICONS.code}<span>${t("pasteJson")}</span></button>
           <button class="km-item" id="btn-add-key-export-json">${ICONS.copy}<span>${t("copyJson")}</span></button>
-          <button class="km-item" id="btn-share-qr">${ICONS.qr}<span>${t("shareQr")}</span></button>
           <button class="km-item" id="btn-refresh-all-subs">${ICONS.refresh}<span>${t("refreshAllSubs")}</span></button>
           <button class="km-item" id="btn-toggle-sub-auto">${ICONS.bolt}<span>${settings.sub_auto_update ? t("subAutoUpdateOn") : t("subAutoUpdateOff")}</span></button>
         </div>
@@ -1633,24 +1352,10 @@ function bindProfileEvents(): void {
       showProfileModal();
     }
   });
-  document.getElementById("btn-add-key-qr")?.addEventListener("click", async (e) => {
+  document.getElementById("btn-qr")?.addEventListener("click", (e) => {
     e.stopPropagation();
     document.querySelectorAll<HTMLElement>(".key-menu").forEach(m => { m.hidden = true; });
-    let content: string;
-    try {
-      let perm = await qrCheckPermissions();
-      if (perm !== "granted") perm = await qrRequestPermissions();
-      if (perm !== "granted") { showToast(t("qrScanFailed"), "error", 2500); return; }
-      const result = await qrScan({ windowed: false, formats: [QrFormat.QRCode] });
-      content = result?.content ?? "";
-    } catch (err) {
-      console.error("qr scan failed", err);
-      if (/cancel/i.test(String((err as { message?: string })?.message ?? err ?? ""))) return;
-      showToast(t("qrScanFailed"), "error", 2500);
-      return;
-    }
-    if (!content) return;
-    handlePastedOrScannedText(content);
+    showQrModal();
   });
   document.getElementById("btn-add-key-import-json")?.addEventListener("click", (e) => {
     e.stopPropagation();
@@ -1667,11 +1372,6 @@ function bindProfileEvents(): void {
     } catch {
       showToast(t("clipboardWriteFailed"), "error", 2500);
     }
-  });
-  document.getElementById("btn-share-qr")?.addEventListener("click", (e) => {
-    e.stopPropagation();
-    document.querySelectorAll<HTMLElement>(".key-menu").forEach(m => { m.hidden = true; });
-    showShareQrModal();
   });
   document.getElementById("btn-refresh-all-subs")?.addEventListener("click", async (e) => {
     e.stopPropagation();
@@ -2482,8 +2182,46 @@ function pills(attr: string, active: string, opts: [string, string][], attrs = "
     + `</div>`;
 }
 
-function textField(id: string, value: string, placeholder: string): string {
-  return `<input type="text" id="${id}" value="${esc(value)}" placeholder="${placeholder}" style="width:100%;box-sizing:border-box;text-align:left"/>`;
+function textField(id: string, value: string, placeholder: string, readonly = false): string {
+  return `<input type="text" id="${id}" value="${esc(value)}" placeholder="${placeholder}"${readonly ? " readonly" : ""} style="width:100%;box-sizing:border-box;text-align:left"/>`;
+}
+
+const KNOWN_DNS: [string, string[]][] = [
+  ["Cloudflare", ["1.1.1.1", "1.0.0.1"]],
+  ["Google", ["8.8.8.8", "8.8.4.4"]],
+  ["Quad9", ["9.9.9.9", "149.112.112.112"]],
+  ["OpenDNS", ["208.67.222.222", "208.67.220.220"]],
+  ["AdGuard", ["94.140.14.14", "94.140.15.15"]],
+  ["CleanBrowsing", ["185.228.168.9", "185.228.169.9"]],
+  ["Control D", ["76.76.2.0", "76.76.10.0"]],
+  ["DNS.SB", ["185.222.222.222", "45.11.45.11"]],
+  ["Comodo", ["8.26.56.26", "8.20.247.20"]],
+  ["Level3", ["4.2.2.1", "4.2.2.2"]],
+];
+const SYSTEM_DNS = "system";
+
+function dnsPicker(id: string, value: string, placeholder: string): string {
+  const address = (ip: string) =>
+    `<button class="dns-picker-ip${ip === value ? " active" : ""}" data-dns="${ip}">${ip}</button>`;
+  const known = KNOWN_DNS.some(([, ips]) => ips.includes(value)) || value === SYSTEM_DNS;
+  const items = `<div class="dns-table">
+      <span class="dns-table-head">${t("dnsService")}</span>
+      <span class="dns-table-head">${t("dnsPrimary")}</span>
+      <span class="dns-table-head">${t("dnsSecondary")}</span>
+      ${KNOWN_DNS.map(([name, [primary, secondary]]) =>
+        `<span class="dns-table-name">${esc(name)}</span>${address(primary)}${address(secondary)}`).join("")}
+      <span class="dns-table-name">${t("isp")}</span>${address(SYSTEM_DNS)}<span></span>
+      <div class="dns-table-custom">
+        <span class="dns-table-name">${t("dnsCustom")}</span>
+        <input type="text" id="dns-custom" value="${known ? "" : esc(value)}" placeholder="${t("dnsCustomHint")}"/>
+        <button class="btn-sm" id="dns-custom-save">${t("save")}</button>
+      </div>
+    </div>`;
+  return `<div class="dns-picker">
+    ${textField(id, value, placeholder, true)}
+    <span class="dns-picker-chevron">${ICONS.chevronDown}</span>
+    <div class="key-menu dns-picker-menu" hidden>${items}</div>
+  </div>`;
 }
 
 function whispSection(extraRows: string): string {
@@ -2531,6 +2269,8 @@ function renderSettings(): string {
       ${row(t("mtuLabel"), `<input type="number" id="set-mtu" min="576" max="9000" value="${settings.mtu ?? 1500}" style="width:80px;box-sizing:border-box;text-align:right"/>`)}
       ${row(t("tlsFragment"), toggleBox("set-tls-fragment", !!settings.tls_fragment))}
       ${row(t("ipv6Label"), toggleBox("set-ipv6", !!settings.ipv6))}
+      ${row(t("ipv6FallbackLabel"), toggleBox("set-ipv6-fallback", settings.ipv6_fallback !== false))}
+      ${row(t("ipv6OnlyLabel"), toggleBox("set-ipv6-only", !!settings.ipv6_only))}
       ${row(t("tunStackLabel"), pills("data-tunstack", settings.tun_stack_android || "gvisor", [["gvisor", "gVisor"], ["system", "System"], ["mixed", "Mixed"]]))}
       ${row(t("quicLabel"), toggleBox("set-quic", !!settings.quic))}
       ${row(t("killSwitchLabel"),
@@ -2565,8 +2305,10 @@ function renderSettings(): string {
           textField("set-custom-dns", (settings.custom_dns || []).join(", "), "77.88.8.8, 8.8.8.8")
           + `<span class="setting-hint">${t("dnsCommaSep")}</span>`,
           "", ` style="flex-direction:column;align-items:stretch;gap:4px"`)}
-      ${row(t("vpnDns"), vpnDnsPills + textField("set-vpn-dns", vpnDnsVal, "1.1.1.1:53"), "", COLUMN_VALUE)}
+      ${row(t("vpnDns"), dnsPicker("set-vpn-dns", vpnDnsVal, "1.1.1.1:53"), "", COLUMN_VALUE)}
       ${row(t("ipv6Label"), toggleBox("set-ipv6", !!settings.ipv6))}
+      ${row(t("ipv6FallbackLabel"), toggleBox("set-ipv6-fallback", settings.ipv6_fallback !== false))}
+      ${row(t("ipv6OnlyLabel"), toggleBox("set-ipv6-only", !!settings.ipv6_only))}
       ${row(t("bypassMode"), toggleBox("set-bypass-ru", settings.bypass_ru !== false), t("bypassModeHint"))}
       ${row(t("secretLabel"), `<span class="secret-value">${settings.secret}</span><button class="btn-sm" id="btn-copy-secret">${t("copy")}</button>`)}
       ${socksAuthRow()}
@@ -2674,6 +2416,24 @@ function bindSettingsEvents(): void {
     persistSettings();
     if (isConnected) showToast(t("reconnectToApply"), "info", 3000);
   });
+  const dnsMenu = document.querySelector<HTMLElement>(".dns-picker-menu");
+  if (dnsMenu) {
+    const dnsInput = document.getElementById("set-vpn-dns") as HTMLInputElement;
+    const customInput = document.getElementById("dns-custom") as HTMLInputElement;
+    const pickDns = (val: string) => {
+      if (!val) return;
+      dnsInput.value = val;
+      settings.vpn_dns = val;
+      persistSettings();
+      if (isConnected) showToast(t("reconnectToApply"), "info", 3000);
+      renderPage();
+    };
+    dnsInput.addEventListener("click", e => { e.stopPropagation(); dnsMenu.hidden = !dnsMenu.hidden; });
+    dnsMenu.addEventListener("click", e => e.stopPropagation());
+    dnsMenu.querySelectorAll<HTMLElement>("[data-dns]").forEach(el => el.addEventListener("click", () => pickDns(el.dataset.dns || "")));
+    document.getElementById("dns-custom-save")?.addEventListener("click", () => pickDns(customInput.value.trim()));
+    customInput.addEventListener("keydown", e => { if (e.key === "Enter") pickDns(customInput.value.trim()); });
+  }
   document.getElementById("btn-toggle-socks-pass")?.addEventListener("click", function () {
     const inp = document.getElementById("set-socks-pass") as HTMLInputElement | null;
     if (!inp) return;
@@ -2706,7 +2466,7 @@ function bindSettingsEvents(): void {
     persistSettings();
     if (isConnected) showToast(t("reconnectToApply"), "info", 3000);
   });
-  const toggles: [string, keyof AppSettings][] = [["set-dns", "dns_redirect"], ["set-ipv6", "ipv6"], ["set-autostart", "auto_connect"], ["set-bypass-ru", "bypass_ru"]];
+  const toggles: [string, keyof AppSettings][] = [["set-dns", "dns_redirect"], ["set-ipv6", "ipv6"], ["set-ipv6-fallback", "ipv6_fallback"], ["set-ipv6-only", "ipv6_only"], ["set-autostart", "auto_connect"], ["set-bypass-ru", "bypass_ru"]];
   toggles.forEach(([id, key]) => {
     (document.getElementById(id) as HTMLInputElement)?.addEventListener("change", function () {
       (settings as any)[key] = this.checked;
@@ -2868,43 +2628,108 @@ function fitQrToDevicePixels(svg: SVGSVGElement, available: number): void {
   svg.style.height = side;
 }
 
-function showShareQrModal(): void {
+function reportScanFailure(err: unknown): void {
+  console.error("qr scan failed", err);
+  if (/cancel/i.test(String((err as { message?: string })?.message ?? err ?? ""))) return;
+  showToast(t("qrScanFailed"), "error", 2500);
+}
+
+function scanBehindOverlay(): Promise<string> {
+  return new Promise(resolve => {
+    document.documentElement.classList.add("qr-scanning");
+    const overlay = document.createElement("div");
+    overlay.className = "qr-scan-overlay";
+    overlay.innerHTML = `<div class="qr-scan-frame"></div>
+      <div class="qr-scan-hint">${t("qrScanHint")}</div>
+      <button class="btn-save qr-scan-cancel" id="qr-scan-cancel">${t("cancel")}</button>`;
+    document.body.appendChild(overlay);
+    let settled = false;
+    let backListener: Promise<PluginListener | null> = Promise.resolve(null);
+    const finish = (content: string): void => {
+      if (settled) return;
+      settled = true;
+      overlay.remove();
+      document.documentElement.classList.remove("qr-scanning");
+      void backListener.then(l => l?.unregister());
+      resolve(content);
+    };
+    const stop = (): void => {
+      void qrCancel().catch(() => {});
+      finish("");
+    };
+    const cancelButton = overlay.querySelector<HTMLButtonElement>("#qr-scan-cancel")!;
+    cancelButton.addEventListener("click", stop);
+    cancelButton.focus();
+    backListener = onBackButtonPress(stop).catch(() => null);
+    qrScan({ windowed: true, formats: [QrFormat.QRCode] })
+      .then(result => finish(result?.content ?? ""))
+      .catch(err => {
+        if (!settled) reportScanFailure(err);
+        finish("");
+      });
+  });
+}
+
+async function scanQrAndImport(): Promise<boolean> {
+  try {
+    let perm = await qrCheckPermissions();
+    if (perm !== "granted") perm = await qrRequestPermissions();
+    if (perm !== "granted") { showToast(t("qrScanFailed"), "error", 2500); return false; }
+  } catch (err) {
+    reportScanFailure(err);
+    return false;
+  }
+  const content = await scanBehindOverlay();
+  if (!content) return false;
+  handlePastedOrScannedText(content);
+  return true;
+}
+
+function showQrModal(): void {
   const items = shareItems();
-  if (items.length === 0) { showToast(t("nothingToShare"), "info", 2500); return; }
+  const sharePane = items.length
+    ? `<div class="modal-field"><select id="share-qr-item">${items.map((it, i) => `<option value="${i}">${esc(it.label)}</option>`).join("")}</select></div>
+    <div class="share-qr-code" id="share-qr-code"></div>
+    <div class="share-qr-warning">${t("shareQrWarning")}</div>
+    <div class="share-qr-hint">${t("shareQrHint")}</div>`
+    : `<div class="share-qr-empty">${t("nothingToShare")}</div>`;
   const ov = document.createElement("div");
   ov.className = "modal-overlay";
-  ov.innerHTML = `<div class="modal share-qr-modal"><h3>${t("shareQr")}</h3>
-    <div class="modal-field"><select id="share-qr-item">${items.map((it, i) => `<option value="${i}">${esc(it.label)}</option>`).join("")}</select></div>
-    <button type="button" class="share-qr-box concealed" id="share-qr-box">
-      <span class="share-qr-code" id="share-qr-code"></span>
-      <span class="share-qr-reveal"><span class="share-qr-reveal-chip">${ICONS.eye}${t("shareQrReveal")}</span></span>
-    </button>
-    <div class="share-qr-warning">${t("shareQrWarning")}</div>
-    <div class="share-qr-hint">${t("shareQrHint")}</div>
-    <div class="modal-actions"><button class="btn-cancel" id="share-qr-copy">${t("copy")}</button><button class="btn-save" id="share-qr-close">${t("close")}</button></div>
+  ov.innerHTML = `<div class="modal share-qr-modal"><h3>${t("qrCode")}</h3>
+    ${isAndroid ? pills("data-qrtab", "share", [["share", t("qrTabShare")], ["scan", t("qrTabScan")]]) : ""}
+    ${sharePane}
+    <div class="modal-actions">${items.length ? `<button class="btn-cancel" id="share-qr-copy">${t("copy")}</button>` : ""}<button class="btn-save" id="share-qr-close">${t("close")}</button></div>
   </div>`;
   document.body.appendChild(ov);
-  const select = ov.querySelector<HTMLSelectElement>("#share-qr-item")!;
-  const box = ov.querySelector<HTMLButtonElement>("#share-qr-box")!;
+  const life = new AbortController();
+  const close = (): void => {
+    life.abort();
+    ov.remove();
+  };
+  ov.addEventListener("click", e => { if (e.target === ov) close(); });
+  ov.querySelector("#share-qr-close")?.addEventListener("click", close);
+  const scanTab = ov.querySelector<HTMLElement>('[data-qrtab="scan"]');
+  scanTab?.addEventListener("click", async () => {
+    close();
+    if (!(await scanQrAndImport())) showQrModal();
+  });
+  const select = ov.querySelector<HTMLSelectElement>("#share-qr-item");
+  if (!select) {
+    (scanTab ?? ov.querySelector<HTMLElement>("#share-qr-close"))?.focus();
+    return;
+  }
   const code = ov.querySelector<HTMLElement>("#share-qr-code")!;
   const selected = (): ShareItem => items[Number(select.value)];
   const draw = (): void => {
     const svg = shareQrSvg(selected().payload);
-    code.innerHTML = svg ?? `<span class="share-qr-error">${t("shareQrTooLong")}</span>`;
+    code.innerHTML = svg ?? `<div class="share-qr-error">${t("shareQrTooLong")}</div>`;
     const drawn = code.querySelector("svg");
-    if (drawn) fitQrToDevicePixels(drawn, Math.min(box.clientWidth, SHARE_QR_MAX_WIDTH));
-  };
-  const close = (): void => {
-    window.removeEventListener("resize", draw);
-    ov.remove();
+    if (drawn) fitQrToDevicePixels(drawn, Math.min(code.clientWidth, SHARE_QR_MAX_WIDTH));
   };
   select.value = String(activeShareIndex(items));
   draw();
   select.addEventListener("change", draw);
-  window.addEventListener("resize", draw);
-  box.addEventListener("click", () => box.classList.remove("concealed"));
-  ov.addEventListener("click", e => { if (e.target === ov) close(); });
-  ov.querySelector("#share-qr-close")?.addEventListener("click", close);
+  window.addEventListener("resize", draw, { signal: life.signal });
   ov.querySelector("#share-qr-copy")?.addEventListener("click", async () => {
     try {
       await clipboardWrite(selected().payload);
@@ -3024,10 +2849,52 @@ function setupDpadNav(): void {
   }, 300);
 }
 
+/* ===================== ANDROID BACK BUTTON ===================== */
+function openDismissable(): HTMLElement | null {
+  const overlays = document.querySelectorAll<HTMLElement>(".modal-overlay");
+  if (overlays.length) return overlays[overlays.length - 1];
+  const picker = document.getElementById("process-picker-overlay");
+  if (picker && picker.style.display !== "none") return picker;
+  return document.querySelector<HTMLElement>(".key-menu:not([hidden])");
+}
+
+function dismissTopmost(): void {
+  if (document.documentElement.classList.contains("qr-scanning")) return;
+  const top = openDismissable();
+  if (!top) return;
+  if (top.classList.contains("key-menu")) { top.hidden = true; return; }
+  const closer = top.querySelector<HTMLElement>('[id$="-close"], [id$="-cancel"]');
+  if (closer) { closer.click(); return; }
+  top.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  if (top.isConnected && top.classList.contains("modal-overlay")) top.remove();
+}
+
+function setupBackToDismiss(): void {
+  let listener: Promise<PluginListener | null> | null = null;
+  let scheduled = false;
+  const sync = (): void => {
+    scheduled = false;
+    const open = openDismissable() !== null;
+    if (open && !listener) listener = onBackButtonPress(dismissTopmost).catch(() => null);
+    if (!open && listener) {
+      const active = listener;
+      listener = null;
+      void active.then(l => l?.unregister());
+    }
+  };
+  new MutationObserver(() => {
+    if (scheduled) return;
+    scheduled = true;
+    requestAnimationFrame(sync);
+  }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["hidden", "style"] });
+}
+
 /* ===================== INIT ===================== */
 window.addEventListener("DOMContentLoaded", async () => {
   loadLang(); loadProfiles();
+  syncNativeLang();
   setupDpadNav();
+  if (isAndroid) setupBackToDismiss();
   await loadSettings();
   initNotifications().catch(() => {});
   document.addEventListener("click", () => {

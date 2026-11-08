@@ -1,6 +1,7 @@
 package com.whispera.whisp
 
 import android.app.Activity
+import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.net.VpnService
@@ -29,6 +30,7 @@ object WhispVpnPrep {
     @Volatile private var pendingAutoConnect: Boolean = false
     @Volatile private var pendingTunStack: String = "gvisor"
     @Volatile private var pendingQuic: Boolean = false
+    @Volatile private var pendingServerIpv6: String = "auto"
 
     @JvmStatic fun setActivity(a: Activity?) { currentActivity = a }
 
@@ -51,7 +53,7 @@ object WhispVpnPrep {
         }
     }
 
-    @JvmStatic fun savePending(rulesJson: String, connKey: String, vpnDns: String, ipv6: Boolean, hwid: Boolean, tlsFingerprint: String, mixedPort: Int, allowLan: Boolean, socksUser: String, socksPass: String, dnsMode: String, dnsStrategy: String, mtu: Int, tlsFragment: Boolean, autoConnect: Boolean, tunStack: String, quic: Boolean) {
+    @JvmStatic fun savePending(rulesJson: String, connKey: String, vpnDns: String, ipv6: Boolean, hwid: Boolean, tlsFingerprint: String, mixedPort: Int, allowLan: Boolean, socksUser: String, socksPass: String, dnsMode: String, dnsStrategy: String, mtu: Int, tlsFragment: Boolean, autoConnect: Boolean, tunStack: String, quic: Boolean, serverIpv6: String) {
         pendingRulesJson = rulesJson
         pendingConnKey   = connKey
         pendingVpnDns    = vpnDns.ifEmpty { "1.1.1.1" }
@@ -69,6 +71,7 @@ object WhispVpnPrep {
         pendingAutoConnect = autoConnect
         pendingTunStack  = if (tunStack in listOf("system", "gvisor", "mixed")) tunStack else "gvisor"
         pendingQuic      = quic
+        pendingServerIpv6 = serverIpv6
         hasPending       = true
         Log.d("WhispVpnPrep", "savePending: key=${connKey.take(6)}… dns=$vpnDns ipv6=$ipv6 hwid=$hwid fp=$tlsFingerprint mixedPort=$mixedPort allowLan=$allowLan dnsMode=$pendingDnsMode dnsStrategy=$pendingDnsStrategy mtu=$pendingMtu tlsFragment=$pendingTlsFragment")
     }
@@ -78,13 +81,22 @@ object WhispVpnPrep {
     // user — so report its real state and take them to it.
     @JvmStatic fun isLockdown(): Boolean {
         val a = currentActivity ?: return false
-        val p = a.getSharedPreferences("whisp_vpn", Context.MODE_PRIVATE)
+        val p = a.getSharedPreferences(WhispVpnService.PREFS, Context.MODE_PRIVATE)
         return p.getBoolean("lockdown", false)
     }
 
     @JvmStatic fun setAutostart(on: Boolean): Boolean {
         val a = currentActivity ?: return false
-        a.getSharedPreferences("whisp_vpn", Context.MODE_PRIVATE).edit().putBoolean("auto_connect", on).apply()
+        return Autostart.set(a, on)
+    }
+
+    @JvmStatic fun setLanguage(lang: String): Boolean {
+        val a = currentActivity ?: return false
+        ServiceText.save(a, lang)
+        val nm = a.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (nm.activeNotifications.any { it.id == WhispVpnService.NOTIFICATION_ID }) {
+            nm.notify(WhispVpnService.NOTIFICATION_ID, WhispVpnService.buildVpnNotification(a))
+        }
         return true
     }
 
@@ -130,6 +142,7 @@ object WhispVpnPrep {
             putExtra(WhispVpnService.EXTRA_AUTO_CONNECT, if (pendingAutoConnect) "1" else "0")
             putExtra(WhispVpnService.EXTRA_TUN_STACK, pendingTunStack)
             putExtra(WhispVpnService.EXTRA_QUIC, if (pendingQuic) "1" else "0")
+            putExtra(WhispVpnService.EXTRA_SERVER_IPV6, pendingServerIpv6)
         }
         ctx.startForegroundService(intent)
     }

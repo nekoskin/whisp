@@ -10,6 +10,24 @@ const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x00004000;
 
 const SERVICE_NAME: &str = "WhisperaGW";
 const SERVICE_DISPLAY: &str = "Whispera Gateway";
+const KEEP_FULL_DIAL_TRACE: &str = "-dial-trace-mb=512";
+const POLICY_TRAINER_FLAGS: [(&str, &str); 3] = [
+    ("-policy-trainer", "WHISPERA_POLICY_TRAINER"),
+    ("-policy-python", "WHISPERA_POLICY_PYTHON"),
+    ("-pattern-dumps", "WHISPERA_PATTERN_DUMPS"),
+];
+
+fn policy_trainer_args() -> String {
+    POLICY_TRAINER_FLAGS
+        .iter()
+        .filter_map(|(flag, var)| {
+            std::env::var(var)
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(|v| format!(" {} \"{}\"", flag, v.replace('"', "\\\"")))
+        })
+        .collect()
+}
 
 pub struct GoClientManager {
     binary_path: PathBuf,
@@ -27,6 +45,8 @@ pub struct GoClientConfig<'a> {
     pub tls_fingerprint: &'a str,
     pub split_rules: &'a str,
     pub tls_fragment: bool,
+    pub ipv6_fallback: bool,
+    pub ipv6_only: bool,
 }
 
 fn is_forceable_fingerprint(v: &str) -> bool {
@@ -116,7 +136,10 @@ impl GoClientManager {
         } else {
             format!("-server \"{}\"", cfg.server_addr)
         };
-        let mut args = format!("{} -socks \"{}\" -no-tun", key_part, cfg.socks_addr);
+        let mut args = format!(
+            "{} -socks \"{}\" -no-tun {}",
+            key_part, cfg.socks_addr, KEEP_FULL_DIAL_TRACE
+        );
         if !cfg.split_rules.is_empty() {
             args.push_str(&format!(
                 " -split-rules \"{}\"",
@@ -140,6 +163,13 @@ impl GoClientManager {
         if !cfg.tls_fragment {
             args.push_str(" -hello-frag=false");
         }
+        if !cfg.ipv6_fallback {
+            args.push_str(" -ipv6-fallback=false");
+        }
+        if cfg.ipv6_only {
+            args.push_str(" -ipv6-only");
+        }
+        args.push_str(&policy_trainer_args());
 
         args.push_str(&format!(
             " -log-file \"{}\"",
@@ -186,16 +216,6 @@ impl GoClientManager {
             .creation_flags_win(CREATE_NO_WINDOW)
             .output();
 
-        Ok(())
-    }
-
-    pub fn uninstall_service(&mut self) -> Result<(), String> {
-        let _ = self.stop_service();
-        Command::new("sc")
-            .args(["delete", SERVICE_NAME])
-            .creation_flags_win(CREATE_NO_WINDOW)
-            .output()
-            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -286,6 +306,7 @@ impl GoClientManager {
 
         cmd.arg("-socks").arg(cfg.socks_addr);
         cmd.arg("-no-tun");
+        cmd.arg(KEEP_FULL_DIAL_TRACE);
         cmd.arg("-log-file").arg(go_client_log_file());
 
         if !cfg.split_rules.is_empty() {
@@ -310,8 +331,12 @@ impl GoClientManager {
         if !cfg.tls_fragment {
             cmd.arg("-hello-frag=false");
         }
-
-        cmd.env("WHISPERA_SHAPE_SEARCH", "1");
+        if !cfg.ipv6_fallback {
+            cmd.arg("-ipv6-fallback=false");
+        }
+        if cfg.ipv6_only {
+            cmd.arg("-ipv6-only");
+        }
 
         let log_path = std::env::temp_dir().join("whispera-go-client.log");
         cmd.arg("-log-file").arg(&log_path);
@@ -435,15 +460,33 @@ pub(crate) fn control_reachable() -> bool {
 // not. A live process says nothing about a live tunnel: mihomo without TUN and
 // a client that never reached the server both look healthy from outside.
 // None means the client could not be asked at all.
-pub(crate) fn tunnel_state() -> Option<(bool, Option<String>)> {
+pub(crate) struct TunnelState {
+    pub up: bool,
+    pub error: Option<String>,
+    pub failure: Option<serde_json::Value>,
+    pub connected_at: Option<String>,
+}
+
+pub(crate) fn tunnel_state() -> Option<TunnelState> {
     let (200, body) = crate::mihomo::http_get("127.0.0.1:10801", "/connections")? else {
         return None;
     };
     let entries: Vec<serde_json::Value> = serde_json::from_str(&body).ok()?;
     let mut reason = None;
+    let failure = entries
+        .iter()
+        .find_map(|e| e.get("failure").filter(|v| v.is_object()).cloned());
     for e in &entries {
         if e.get("status").and_then(|v| v.as_str()) == Some("connected") {
-            return Some((true, None));
+            return Some(TunnelState {
+                up: true,
+                error: None,
+                failure,
+                connected_at: e
+                    .get("connected_at")
+                    .and_then(|v| v.as_str())
+                    .map(millisecond_timestamp),
+            });
         }
         if reason.is_none() {
             reason = e
@@ -453,7 +496,28 @@ pub(crate) fn tunnel_state() -> Option<(bool, Option<String>)> {
                 .map(str::to_string);
         }
     }
-    Some((false, reason))
+    Some(TunnelState {
+        up: false,
+        error: reason,
+        failure,
+        connected_at: None,
+    })
+}
+
+fn millisecond_timestamp(stamp: &str) -> String {
+    let Some(dot) = stamp.find('.') else {
+        return stamp.to_string();
+    };
+    let fraction = &stamp[dot + 1..];
+    let digits = fraction
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(fraction.len());
+    format!(
+        "{}.{:0<3}{}",
+        &stamp[..dot],
+        &fraction[..digits.min(3)],
+        &fraction[digits..]
+    )
 }
 
 fn service_exists(name: &str) -> bool {
@@ -488,7 +552,23 @@ impl CommandExtWin for Command {
 
 #[cfg(test)]
 mod tests {
-    use super::failure_line;
+    use super::{failure_line, millisecond_timestamp};
+
+    #[test]
+    fn connected_at_is_cut_to_milliseconds_and_keeps_its_offset() {
+        assert_eq!(
+            millisecond_timestamp("2026-10-17T16:38:54.053883208+03:00"),
+            "2026-10-17T16:38:54.053+03:00"
+        );
+        assert_eq!(
+            millisecond_timestamp("2026-10-17T13:38:54.5Z"),
+            "2026-10-17T13:38:54.500Z"
+        );
+        assert_eq!(
+            millisecond_timestamp("2026-10-17T13:38:54Z"),
+            "2026-10-17T13:38:54Z"
+        );
+    }
 
     #[test]
     fn startup_failure_names_the_fatal_line_not_our_exit_note() {

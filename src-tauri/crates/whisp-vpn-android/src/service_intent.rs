@@ -42,6 +42,7 @@ const EXTRA_TLS_FRAGMENT: &str = "com.whispera.whisp.EXTRA_TLS_FRAGMENT";
 const EXTRA_AUTO_CONNECT: &str = "com.whispera.whisp.EXTRA_AUTO_CONNECT";
 const EXTRA_TUN_STACK: &str = "com.whispera.whisp.EXTRA_TUN_STACK";
 const EXTRA_QUIC: &str = "com.whispera.whisp.EXTRA_QUIC";
+const EXTRA_SERVER_IPV6: &str = "com.whispera.whisp.EXTRA_SERVER_IPV6";
 
 fn vm_and_ctx() -> Result<(JavaVM, *mut std::ffi::c_void), String> {
     // SAFETY: ndk_context::android_context() возвращает указатели,
@@ -76,6 +77,7 @@ fn send_action(
     auto_connect: Option<bool>,
     tun_stack: Option<&str>,
     quic: Option<bool>,
+    server_ipv6: Option<&str>,
     _stop: bool,
 ) -> Result<(), String> {
     let (vm, ctx_ptr) = vm_and_ctx()?;
@@ -161,6 +163,9 @@ fn send_action(
     if let Some(q) = quic {
         put_extra(EXTRA_QUIC, if q { "1" } else { "0" })?;
     }
+    if let Some(v6) = server_ipv6 {
+        put_extra(EXTRA_SERVER_IPV6, v6)?;
+    }
     if let Some(fp) = tls_fingerprint {
         put_extra(EXTRA_TLS_FINGERPRINT, fp)?;
     }
@@ -224,6 +229,7 @@ pub fn start_vpn_service(
     auto_connect: bool,
     tun_stack: &str,
     quic: bool,
+    server_ipv6: &str,
 ) -> Result<(), String> {
     let dns = if vpn_dns.is_empty() {
         None
@@ -275,6 +281,7 @@ pub fn start_vpn_service(
         Some(auto_connect),
         Some(tun_stack),
         Some(quic),
+        Some(server_ipv6),
         false,
     );
     if r.is_ok() {
@@ -286,6 +293,7 @@ pub fn start_vpn_service(
 pub fn stop_vpn_service() -> Result<(), String> {
     let r = send_action(
         ACTION_STOP,
+        None,
         None,
         None,
         None,
@@ -332,6 +340,21 @@ pub fn set_autostart(on: bool) -> Result<bool, String> {
     )
     .and_then(|v| v.z())
     .map_err(|e| format!("setAutostart: {}", e))
+}
+
+pub fn set_language(lang: &str) -> Result<bool, String> {
+    let (vm, ctx_ptr) = vm_and_ctx()?;
+    let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+    let cls = prep_class(&mut env, ctx_ptr)?;
+    let jlang = env.new_string(lang).map_err(|e| e.to_string())?;
+    env.call_static_method(
+        &cls,
+        "setLanguage",
+        "(Ljava/lang/String;)Z",
+        &[JValue::Object(&jlang.into())],
+    )
+    .and_then(|v| v.z())
+    .map_err(|e| format!("setLanguage: {}", e))
 }
 
 fn prep_class<'a>(
@@ -454,6 +477,7 @@ pub fn save_pending_start(
     auto_connect: bool,
     tun_stack: &str,
     quic: bool,
+    server_ipv6: &str,
 ) -> Result<(), String> {
     let (vm, ctx_ptr) = vm_and_ctx()?;
     let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
@@ -484,10 +508,11 @@ pub fn save_pending_start(
     let j_mode = env.new_string(dns_mode).map_err(|e| e.to_string())?;
     let j_strat = env.new_string(dns_strategy).map_err(|e| e.to_string())?;
     let j_stack = env.new_string(tun_stack).map_err(|e| e.to_string())?;
+    let j_server_ipv6 = env.new_string(server_ipv6).map_err(|e| e.to_string())?;
     env.call_static_method(
         &cls_class,
         "savePending",
-        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZZLjava/lang/String;IZLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;IZZLjava/lang/String;Z)V",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZZLjava/lang/String;IZLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;IZZLjava/lang/String;ZLjava/lang/String;)V",
         &[
             JValue::Object(&j_rules.into()),
             JValue::Object(&j_key.into()),
@@ -506,6 +531,7 @@ pub fn save_pending_start(
             JValue::Bool(if auto_connect { 1 } else { 0 }),
             JValue::Object(&j_stack.into()),
             JValue::Bool(if quic { 1 } else { 0 }),
+            JValue::Object(&j_server_ipv6.into()),
         ],
     )
     .map_err(|e| format!("savePending: {}", e))?;

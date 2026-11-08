@@ -12,9 +12,9 @@ class BootReceiver : BroadcastReceiver() {
             receivedAction != "android.intent.action.QUICKBOOT_POWERON"
         ) return
 
-        val p = ctx.getSharedPreferences("whisp_vpn", Context.MODE_PRIVATE)
+        val p = ctx.getSharedPreferences(WhispVpnService.PREFS, Context.MODE_PRIVATE)
         val key = p.getString("conn_key", "") ?: ""
-        val auto = p.getBoolean("auto_connect", false)
+        val auto = Autostart.isOn(ctx)
         if (key.isEmpty() || !auto) {
             Log.i("BootReceiver", "boot: skip (key empty=${key.isEmpty()} auto=$auto)")
             return

@@ -9,12 +9,84 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x00004000;
 
 const SERVICE_NAME: &str = "WhisperaNH";
+#[cfg(windows)]
 const SERVICE_DISPLAY: &str = "Whispera Network Helper";
+
+const CONTROLLER_ADDR: &str = "127.0.0.1:9090";
+const CONTROLLER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const TUN_OFF: &str = r#"{"tun":{"enable":false}}"#;
+const TUN_DEVICE: &str = "Meta";
+#[cfg(any(windows, test))]
+const TUN_TASK: &str = "WhispTUN";
+#[cfg(windows)]
+const OWNER_PID_FILE: &str = "whisp-owner.pid";
+#[cfg(windows)]
+const TUN_TASK_STAMP_FILE: &str = "tun-task.sha256";
+#[cfg(windows)]
+const TUN_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn controller_secret(config: &str) -> Option<&str> {
+    config
+        .lines()
+        .find_map(|line| line.strip_prefix("secret:"))
+        .map(|value| value.trim().trim_matches('"'))
+}
+
+#[cfg(any(windows, test))]
+fn remove_stale_tun_script() -> String {
+    format!(
+        "$id = [guid]::new([Security.Cryptography.MD5]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes('wintun{TUN_DEVICE}')))\n\
+         & pnputil.exe /remove-device \"SWD\\Wintun\\{{$id}}\" | Out-Null"
+    )
+}
+
+#[cfg(any(windows, test))]
+fn tun_task_script(bin: &str, home_dir: &str, config: &str, pid_file: &str, owner: &str) -> String {
+    let quoted = |s: &str| s.replace('\'', "''");
+    format!(
+        "$pidFile = '{pid_file}'\n\
+         $ownerId = 0\n\
+         if (-not [int]::TryParse(\"$(Get-Content -Raw -LiteralPath $pidFile -ErrorAction SilentlyContinue)\".Trim(), [ref]$ownerId)) {{ exit 1 }}\n\
+         $owner = Get-Process -Id $ownerId -ErrorAction SilentlyContinue\n\
+         if (-not $owner -or $owner.ProcessName -ne '{owner}') {{ exit 1 }}\n\
+         $null = $owner.Handle\n\
+         {cleanup}\n\
+         $mihomo = Start-Process -FilePath '{bin}' -ArgumentList '-d','{home_dir}','-f','{config}' -WindowStyle Hidden -PassThru\n\
+         while (-not $mihomo.WaitForExit(500)) {{\n\
+         \x20   if ($owner.HasExited -or -not (Test-Path -LiteralPath $pidFile)) {{ Stop-Process -Id $mihomo.Id -Force; break }}\n\
+         }}",
+        pid_file = quoted(pid_file),
+        owner = quoted(owner),
+        cleanup = remove_stale_tun_script(),
+        bin = quoted(bin),
+        home_dir = quoted(home_dir),
+        config = quoted(config),
+    )
+}
+
+#[cfg(any(windows, test))]
+fn register_tun_task_script(task_args: &str, user_sid: &str) -> String {
+    format!(
+        "$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '{task_args}'\n\
+         $principal = New-ScheduledTaskPrincipal -UserId '{user_sid}' -LogonType Interactive -RunLevel Highest\n\
+         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances Parallel\n\
+         Register-ScheduledTask -TaskName '{TUN_TASK}' -Action $action -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null"
+    )
+}
+
+#[cfg(any(windows, test))]
+fn encoded_powershell(script: &str) -> String {
+    use base64::Engine;
+    let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    base64::engine::general_purpose::STANDARD.encode(utf16)
+}
 
 pub struct MihomoManager {
     binary_path: PathBuf,
+    config_path: Option<PathBuf>,
     process: Option<Child>,
     elevated: bool,
+    idle: bool,
     use_service: bool,
     #[cfg(target_os = "macos")]
     tun_session: Option<std::os::unix::net::UnixStream>,
@@ -57,8 +129,10 @@ impl MihomoManager {
     pub fn new(binary_path: PathBuf) -> Self {
         Self {
             binary_path,
+            config_path: None,
             process: None,
             elevated: false,
+            idle: false,
             use_service: false,
             #[cfg(target_os = "macos")]
             tun_session: None,
@@ -69,38 +143,6 @@ impl MihomoManager {
     pub fn install_tun_helper(&self, config_path: &Path) -> Result<(), String> {
         let settings = crate::tun_helper::HelperSettings::for_current_user(config_path);
         crate::tun_helper::ensure_installed(&settings, &self.binary_path)
-    }
-
-    #[cfg(windows)]
-    pub fn service_installed() -> bool {
-        service_exists(SERVICE_NAME)
-    }
-
-    #[cfg(windows)]
-    pub fn remove_persistent_service(&mut self) -> Result<(), String> {
-        let script = format!(
-            "sc.exe stop {name} | Out-Null; sc.exe delete {name} | Out-Null",
-            name = SERVICE_NAME
-        );
-        let status = Command::new("powershell")
-            .args([
-                "-WindowStyle",
-                "Hidden",
-                "-NonInteractive",
-                "-Command",
-                &format!(
-                    "Start-Process powershell -ArgumentList '-WindowStyle','Hidden','-NonInteractive','-Command','{}' -Verb RunAs -WindowStyle Hidden -Wait",
-                    script
-                ),
-            ])
-            .creation_flags_win(CREATE_NO_WINDOW)
-            .status()
-            .map_err(|e| format!("elevation failed: {}", e))?;
-        if !status.success() {
-            return Err("UAC elevation was denied".to_string());
-        }
-        self.use_service = false;
-        Ok(())
     }
 
     #[cfg(windows)]
@@ -152,98 +194,12 @@ impl MihomoManager {
         Ok(())
     }
 
-    pub fn install_service(&self, config_path: &Path) -> Result<(), String> {
-        let bin = self.binary_path.to_string_lossy().to_string();
-        let cfg = config_path.to_string_lossy().to_string();
-        let home_dir = config_path
-            .parent()
-            .unwrap_or(config_path)
-            .to_string_lossy()
-            .to_string();
-
-        let bin_path = format!(
-            "\"{}\" -d \"{}\" -f \"{}\"",
-            bin.replace('"', "\\\""),
-            home_dir.replace('"', "\\\""),
-            cfg.replace('"', "\\\""),
-        );
-
-        let _ = Command::new("sc")
-            .args(["stop", SERVICE_NAME])
-            .creation_flags_win(CREATE_NO_WINDOW)
-            .output();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
-        while std::time::Instant::now() < deadline {
-            if !service_running(SERVICE_NAME) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+    #[cfg(windows)]
+    pub fn ensure_persistent_service(&self, config_path: &Path) -> Result<(), String> {
+        if service_exists(SERVICE_NAME) {
+            return Ok(());
         }
-        let _ = Command::new("sc")
-            .args(["delete", SERVICE_NAME])
-            .creation_flags_win(CREATE_NO_WINDOW)
-            .output();
-
-        let status = Command::new("sc")
-            .args([
-                "create",
-                SERVICE_NAME,
-                &format!("binPath= {}", bin_path),
-                "type=",
-                "own",
-                "start=",
-                "demand",
-                &format!("DisplayName= {}", SERVICE_DISPLAY),
-                "error=",
-                "ignore",
-            ])
-            .creation_flags_win(CREATE_NO_WINDOW)
-            .output()
-            .map_err(|e| format!("sc create failed: {}", e))?;
-
-        if !status.status.success() {
-            let stdout = String::from_utf8_lossy(&status.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&status.stderr).to_string();
-            if !stdout.contains("1073") && !stderr.contains("1073") {
-                return Err(format!("Service install failed: {} {}", stdout, stderr));
-            }
-        }
-
-        let _ = Command::new("sc")
-            .args([
-                "description",
-                SERVICE_NAME,
-                "Whispera VPN network proxy and TUN routing",
-            ])
-            .creation_flags_win(CREATE_NO_WINDOW)
-            .output();
-
-        let _ = Command::new("sc")
-            .args(["config", SERVICE_NAME, "obj=", "LocalSystem"])
-            .creation_flags_win(CREATE_NO_WINDOW)
-            .output();
-
-        Ok(())
-    }
-
-    pub fn uninstall_service(&mut self) -> Result<(), String> {
-        let _ = Command::new("sc")
-            .args(["stop", SERVICE_NAME])
-            .creation_flags_win(CREATE_NO_WINDOW)
-            .output();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
-        while std::time::Instant::now() < deadline {
-            if !service_running(SERVICE_NAME) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        Command::new("sc")
-            .args(["delete", SERVICE_NAME])
-            .creation_flags_win(CREATE_NO_WINDOW)
-            .output()
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        self.install_persistent_service(config_path)
     }
 
     #[cfg(windows)]
@@ -298,7 +254,14 @@ impl MihomoManager {
         Ok(())
     }
 
-    pub fn start(&mut self, config_path: &Path) -> Result<(), String> {
+    pub fn start(&mut self, config_path: &Path, tun: bool) -> Result<(), String> {
+        self.config_path = Some(config_path.to_path_buf());
+        #[cfg(windows)]
+        if self.elevated && self.reload_config(config_path) {
+            self.idle = false;
+            return Ok(());
+        }
+        self.idle = false;
         if self.is_running() {
             self.stop()?;
         }
@@ -317,15 +280,22 @@ impl MihomoManager {
             }
         }
 
+        #[cfg(not(windows))]
+        let _ = tun;
+
         #[cfg(windows)]
         {
+            if !tun {
+                return self.start_direct(config_path);
+            }
             if service_exists(SERVICE_NAME) && self.start_service().is_ok() {
                 return Ok(());
             }
             return if is_admin() {
+                remove_stale_tun();
                 self.start_direct(config_path)
             } else {
-                self.start_elevated(config_path)
+                self.start_via_task(config_path)
             };
         }
 
@@ -431,40 +401,38 @@ impl MihomoManager {
     }
 
     #[cfg(windows)]
-    fn start_elevated(&mut self, config_path: &Path) -> Result<(), String> {
-        let bin = self.binary_path.to_string_lossy().to_string();
-        let cfg = config_path.to_string_lossy().to_string();
-        let home_dir = config_path
-            .parent()
-            .unwrap_or(config_path)
-            .to_string_lossy()
-            .to_string();
+    fn start_via_task(&mut self, config_path: &Path) -> Result<(), String> {
+        use sha2::{Digest, Sha256};
 
-        let ps_cmd = format!(
-            "Start-Process -FilePath '{}' -ArgumentList '-d','{}','-f','{}' -Verb RunAs -WindowStyle Hidden",
-            bin.replace('\'', "''"),
-            home_dir.replace('\'', "''"),
-            cfg.replace('\'', "''")
+        let home_dir = config_path.parent().unwrap_or(config_path);
+        let pid_file = home_dir.join(OWNER_PID_FILE);
+        let owner = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.file_stem().map(|s| s.to_string_lossy().to_string()))
+            .ok_or("cannot resolve Whisp's own executable")?;
+        let script = tun_task_script(
+            &self.binary_path.to_string_lossy(),
+            &home_dir.to_string_lossy(),
+            &config_path.to_string_lossy(),
+            &pid_file.to_string_lossy(),
+            &owner,
         );
+        let task_args = format!(
+            "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand {}",
+            encoded_powershell(&script)
+        );
+        let stamp = format!("{:x}", Sha256::digest(task_args.as_bytes()));
+        let stamp_path = home_dir.join(TUN_TASK_STAMP_FILE);
 
-        let status = Command::new("powershell")
-            .args([
-                "-WindowStyle",
-                "Hidden",
-                "-NonInteractive",
-                "-Command",
-                &ps_cmd,
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags_win(CREATE_NO_WINDOW)
-            .spawn()
-            .map_err(|e| format!("Failed to elevate mihomo: {}", e))?
-            .wait()
-            .map_err(|e| e.to_string())?;
-
-        if !status.success() {
-            return Err("UAC elevation was denied".to_string());
+        std::fs::write(&pid_file, std::process::id().to_string())
+            .map_err(|e| format!("owner pid file: {e}"))?;
+        let registered = std::fs::read_to_string(&stamp_path).is_ok_and(|s| s == stamp);
+        if !(registered && run_tun_task()) {
+            register_tun_task(&task_args)?;
+            let _ = std::fs::write(&stamp_path, &stamp);
+            if !run_tun_task() {
+                return Err(format!("scheduled task {TUN_TASK} did not start"));
+            }
         }
 
         self.process = None;
@@ -473,7 +441,70 @@ impl MihomoManager {
         Ok(())
     }
 
+    fn controller_call(&self, method: &str, path: &str, body: &str) -> bool {
+        let Some(config) = self
+            .config_path
+            .as_deref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+        else {
+            return false;
+        };
+        matches!(
+            http_request(
+                CONTROLLER_ADDR,
+                method,
+                path,
+                controller_secret(&config),
+                body,
+                CONTROLLER_TIMEOUT,
+            ),
+            Some((200..=299, _))
+        )
+    }
+
+    fn close_tun(&self) -> bool {
+        self.controller_call("PATCH", "/configs", TUN_OFF)
+    }
+
+    #[cfg(windows)]
+    fn reload_config(&self, config_path: &Path) -> bool {
+        let path = config_path.to_string_lossy().replace('\\', "/");
+        let body = serde_json::json!({ "path": path }).to_string();
+        self.controller_call("PUT", "/configs?force=true", &body)
+    }
+
+    #[cfg(windows)]
+    fn release_tun_task(&self) {
+        let Some(home_dir) = self.config_path.as_deref().and_then(Path::parent) else {
+            return;
+        };
+        let _ = std::fs::remove_file(home_dir.join(OWNER_PID_FILE));
+        let deadline = std::time::Instant::now() + TUN_STOP_WAIT;
+        while running_instances() > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.idle
+    }
+
+    pub fn stop_tun(&mut self) -> Result<(), String> {
+        #[cfg(windows)]
+        if self.elevated && self.close_tun() {
+            self.idle = true;
+            return Ok(());
+        }
+        self.stop()
+    }
+
     pub fn stop(&mut self) -> Result<(), String> {
+        self.close_tun();
+        self.idle = false;
+        #[cfg(windows)]
+        if self.elevated {
+            self.release_tun_task();
+        }
         if self.use_service {
             return self.stop_service();
         }
@@ -499,7 +530,7 @@ impl MihomoManager {
                 .ok()
                 .and_then(|mut c| c.wait().ok());
 
-            if self.elevated || self.process.is_none() {
+            if (self.elevated || self.process.is_none()) && running_instances() > 0 {
                 Command::new("powershell")
                     .args([
                         "-WindowStyle", "Hidden", "-NonInteractive", "-Command",
@@ -552,6 +583,9 @@ impl MihomoManager {
     }
 
     pub fn is_running(&mut self) -> bool {
+        if self.idle {
+            return false;
+        }
         if self.use_service {
             return api_reachable();
         }
@@ -580,7 +614,7 @@ impl MihomoManager {
 
 impl Drop for MihomoManager {
     fn drop(&mut self) {
-        self.stop().ok();
+        self.stop_tun().ok();
     }
 }
 
@@ -648,6 +682,54 @@ fn current_user_sid() -> Result<String, String> {
 }
 
 #[cfg(windows)]
+fn remove_stale_tun() {
+    let _ = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-EncodedCommand",
+            &encoded_powershell(&remove_stale_tun_script()),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags_win(CREATE_NO_WINDOW)
+        .status();
+}
+
+#[cfg(windows)]
+fn register_tun_task(task_args: &str) -> Result<(), String> {
+    let script = register_tun_task_script(task_args, &current_user_sid()?);
+    let ps_cmd = format!(
+        "$p = Start-Process -FilePath 'powershell' -ArgumentList '-NoProfile','-NonInteractive','-WindowStyle','Hidden','-EncodedCommand','{}' -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode",
+        encoded_powershell(&script)
+    );
+    let status = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags_win(CREATE_NO_WINDOW)
+        .status()
+        .map_err(|e| format!("Failed to elevate: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "UAC elevation was denied or scheduled task {TUN_TASK} could not be registered"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn run_tun_task() -> bool {
+    Command::new("schtasks")
+        .args(["/run", "/tn", TUN_TASK])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags_win(CREATE_NO_WINDOW)
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[cfg(windows)]
 fn service_exists(name: &str) -> bool {
     Command::new("sc")
         .args(["query", name])
@@ -664,14 +746,45 @@ fn service_exists(name: &str) -> bool {
 // A listening port only proves something holds it. Asking the process's own
 // control API proves it is up and serving, which is what the caller means.
 pub(crate) fn http_get(addr: &str, path: &str) -> Option<(u16, String)> {
+    http_request(
+        addr,
+        "GET",
+        path,
+        None,
+        "",
+        std::time::Duration::from_millis(400),
+    )
+}
+
+fn http_request(
+    addr: &str,
+    method: &str,
+    path: &str,
+    secret: Option<&str>,
+    body: &str,
+    timeout: std::time::Duration,
+) -> Option<(u16, String)> {
     use std::io::{Read, Write};
 
     let addr = addr.parse::<std::net::SocketAddr>().ok()?;
-    let timeout = std::time::Duration::from_millis(400);
     let mut conn = std::net::TcpStream::connect_timeout(&addr, timeout).ok()?;
     let _ = conn.set_read_timeout(Some(timeout));
     let _ = conn.set_write_timeout(Some(timeout));
-    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    let auth = secret
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("Authorization: Bearer {s}\r\n"))
+        .unwrap_or_default();
+    let content = if body.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        )
+    };
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}{content}Connection: close\r\n\r\n{body}"
+    );
     conn.write_all(req.as_bytes()).ok()?;
 
     let mut raw = Vec::new();
@@ -690,7 +803,7 @@ pub(crate) fn http_ok(addr: &str, path: &str) -> bool {
 }
 
 fn api_reachable() -> bool {
-    http_ok("127.0.0.1:9090", "/version")
+    http_ok(CONTROLLER_ADDR, "/version")
 }
 
 fn service_running(name: &str) -> bool {
@@ -884,6 +997,7 @@ pub struct MihomoConfig<'a> {
     pub socks_addr: &'a str,
     pub server_host: &'a str,
     pub mixed_port: u16,
+    pub tun: bool,
     pub tun_stack: &'a str,
     pub dns_redirect: bool,
     pub ipv6: bool,
@@ -1104,6 +1218,7 @@ pub fn generate_config(cfg: &MihomoConfig) -> String {
         format!("secret: \"{}\"\n", cfg.secret)
     };
     let strict_route = cfg.kill_switch;
+    let tun = cfg.tun;
 
     let auth_block = if !cfg.socks_user.is_empty() && !cfg.socks_pass.is_empty() {
         format!(
@@ -1142,7 +1257,7 @@ allow-lan: {allow_lan}
 ipv6: {ipv6}
 mode: {routing_mode}
 log-level: {log_level}
-external-controller: 127.0.0.1:9090
+external-controller: {CONTROLLER_ADDR}
 {controller_secret}find-process-mode: strict
 
 sniffer:
@@ -1179,9 +1294,9 @@ dns:
 {resolvers}
 
 tun:
-  enable: true
+  enable: {tun}
   stack: {tun_stack}
-  device: Meta
+  device: {TUN_DEVICE}
   dns-hijack:
     - any:53
   auto-route: true
@@ -1380,6 +1495,155 @@ mod tests {
             ..test_config(&[])
         });
         assert_eq!(config_value(&locked, "secret"), "\"abc123\"", "{locked}");
+    }
+
+    #[test]
+    fn controller_secret_is_read_back_from_the_generated_config() {
+        use super::{controller_secret, generate_config, MihomoConfig};
+        assert_eq!(controller_secret(&generate_config(&test_config(&[]))), None);
+        let locked = generate_config(&MihomoConfig {
+            secret: "abc123",
+            ..test_config(&[])
+        });
+        assert_eq!(controller_secret(&locked), Some("abc123"));
+    }
+
+    #[test]
+    fn stale_tun_is_removed_by_the_id_wintun_gives_the_device() {
+        use super::{generate_config, remove_stale_tun_script, TUN_DEVICE};
+        let script = remove_stale_tun_script();
+        assert!(
+            script.contains(&format!("GetBytes('wintun{TUN_DEVICE}')")),
+            "{script}"
+        );
+        assert!(
+            script.contains(r#"pnputil.exe /remove-device "SWD\Wintun\{$id}""#),
+            "{script}"
+        );
+        let config = generate_config(&test_config(&[]));
+        assert_eq!(config_value(&config, "device"), TUN_DEVICE, "{config}");
+    }
+
+    #[test]
+    fn tun_task_runs_mihomo_only_for_a_live_whisp() {
+        use super::{remove_stale_tun_script, tun_task_script};
+        let home = r"C:\Users\O'Neil\AppData\Roaming\com.whispera.whisp";
+        let script = tun_task_script(
+            r"C:\Program Files\Whisp\mihomo.exe",
+            home,
+            &format!(r"{home}\mihomo_config.yaml"),
+            &format!(r"{home}\whisp-owner.pid"),
+            "Whisp",
+        );
+        let owner_check = script
+            .find("$owner.ProcessName -ne 'Whisp'")
+            .expect("owner check");
+        let cleanup = script
+            .find(&remove_stale_tun_script())
+            .expect("stale adapter cleanup");
+        let launch = script
+            .find(r"-FilePath 'C:\Program Files\Whisp\mihomo.exe'")
+            .expect("mihomo launch");
+        assert!(owner_check < cleanup && cleanup < launch, "{script}");
+        assert!(
+            script.starts_with(r"$pidFile = 'C:\Users\O''Neil\"),
+            "{script}"
+        );
+        assert!(
+            script.contains(
+                "if ($owner.HasExited -or -not (Test-Path -LiteralPath $pidFile)) { Stop-Process -Id $mihomo.Id -Force; break }"
+            ),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn tun_task_is_registered_elevated_for_the_current_user() {
+        use super::{register_tun_task_script, TUN_TASK};
+        let script = register_tun_task_script("-EncodedCommand AAAA", "S-1-5-21-1-2-3-1001");
+        assert!(
+            script.contains("-Execute 'powershell.exe' -Argument '-EncodedCommand AAAA'"),
+            "{script}"
+        );
+        assert!(
+            script
+                .contains("-UserId 'S-1-5-21-1-2-3-1001' -LogonType Interactive -RunLevel Highest"),
+            "{script}"
+        );
+        assert!(
+            script.contains(&format!("-TaskName '{TUN_TASK}'")),
+            "{script}"
+        );
+        assert!(
+            script.contains("-ExecutionTimeLimit ([TimeSpan]::Zero)"),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn encoded_powershell_is_utf16_base64_of_the_script() {
+        use super::encoded_powershell;
+        use base64::Engine;
+        let script = "Write-Output 'Мета'";
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(encoded_powershell(script))
+            .expect("base64");
+        let units: Vec<u16> = raw
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect();
+        assert_eq!(String::from_utf16(&units).expect("utf16"), script);
+    }
+
+    #[test]
+    fn tun_is_closed_with_an_authorized_patch() {
+        use super::{http_request, TUN_OFF};
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept");
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !String::from_utf8_lossy(&raw).ends_with(TUN_OFF) {
+                let n = conn.read(&mut buf).expect("read");
+                assert!(
+                    n > 0,
+                    "request ended early: {}",
+                    String::from_utf8_lossy(&raw)
+                );
+                raw.extend_from_slice(&buf[..n]);
+            }
+            conn.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .expect("write");
+            String::from_utf8_lossy(&raw).to_string()
+        });
+
+        let reply = http_request(
+            &addr,
+            "PATCH",
+            "/configs",
+            Some("abc123"),
+            TUN_OFF,
+            std::time::Duration::from_secs(5),
+        );
+        let request = server.join().expect("server");
+        assert_eq!(reply.map(|(code, _)| code), Some(204));
+        assert!(
+            request.starts_with("PATCH /configs HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(
+            request.contains("\r\nAuthorization: Bearer abc123\r\n"),
+            "{request}"
+        );
+        assert!(
+            request.contains(&format!("\r\nContent-Length: {}\r\n", TUN_OFF.len())),
+            "{request}"
+        );
     }
 
     #[test]
@@ -1769,6 +2033,7 @@ mod tests {
             socks_addr: "127.0.0.1:1081",
             server_host: "example.com",
             mixed_port: 7890,
+            tun: true,
             tun_stack: "gvisor",
             dns_redirect: false,
             ipv6: false,

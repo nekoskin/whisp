@@ -407,18 +407,6 @@ pub fn ensure_installed(settings: &HelperSettings, mihomo_source: &Path) -> Resu
 }
 
 #[cfg(target_os = "macos")]
-pub fn uninstall() -> Result<(), String> {
-    let script = std::env::temp_dir().join(format!("{LABEL}-uninstall.sh"));
-    std::fs::write(&script, uninstall_script()).map_err(|e| e.to_string())?;
-    run_as_administrator(&script)
-}
-
-#[cfg(target_os = "macos")]
-pub fn is_installed() -> bool {
-    installed_plist().exists()
-}
-
-#[cfg(target_os = "macos")]
 fn same_contents(source: &Path, installed: &Path) -> bool {
     match (
         crate::sidecar_sha256(source),
@@ -493,6 +481,7 @@ fn install_script(helper_source: &Path, mihomo_source: &Path, plist_source: &Pat
         + "\n"
 }
 
+#[cfg(test)]
 fn uninstall_script() -> String {
     [
         format!("launchctl bootout system/{LABEL} 2>/dev/null || true"),
@@ -1018,6 +1007,7 @@ mod tests {
                 socks_addr: &socks,
                 server_host: &server_host,
                 mixed_port: MIXED_PORT,
+                tun: true,
                 tun_stack: TUN_STACK,
                 dns_redirect: false,
                 ipv6: false,

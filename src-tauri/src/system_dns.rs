@@ -212,6 +212,7 @@ mod tests {
             socks_addr: "127.0.0.1:1081",
             server_host: "example.com",
             mixed_port: 7890,
+            tun: true,
             tun_stack: "mixed",
             dns_redirect,
             ipv6: false,
