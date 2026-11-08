@@ -277,6 +277,8 @@ jobs:
       GRADLE_NETWORK_TIMEOUT_MS: 120000
       GRADLE_DOWNLOAD_TENTATIVES: 6
       GRADLE_DOWNLOAD_BACKOFF_MS: 2000
+      ANDROID_KEY_ALIAS: androiddebugkey
+      ANDROID_KEYSTORE_PASSWORD: android
     steps:
       - uses: actions/checkout@v4
         with:
@@ -461,6 +463,13 @@ jobs:
             mkdir -p ~/.android
             printf '%s' "$KS_B64" | base64 -d > ~/.android/debug.keystore
             echo "Restored stable debug keystore ($(stat -c%s ~/.android/debug.keystore) bytes)"
+            {
+              echo "android.injected.signing.store.file=$HOME/.android/debug.keystore"
+              echo "android.injected.signing.store.password=$ANDROID_KEYSTORE_PASSWORD"
+              echo "android.injected.signing.key.alias=$ANDROID_KEY_ALIAS"
+              echo "android.injected.signing.key.password=$ANDROID_KEYSTORE_PASSWORD"
+            } >> ~/.gradle/gradle.properties
+            echo "ANDROID_SIGNING_KEYSTORE=$HOME/.android/debug.keystore" >> "$GITHUB_ENV"
           else
             echo "ANDROID_KEYSTORE_B64 not set — falling back to ephemeral debug keystore"
           fi
@@ -515,6 +524,18 @@ jobs:
           ls -l apk-out
           for abi in $ANDROID_ABIS; do
             test -f "apk-out/Whisp_${VER}_android-${abi}.apk" || { echo "no APK for $abi"; exit 1; }
+          done
+
+      - name: Check the APKs are signed with the stable keystore
+        if: env.ANDROID_SIGNING_KEYSTORE != ''
+        run: |
+          want=$(keytool -list -v -keystore "$ANDROID_SIGNING_KEYSTORE" -storepass "$ANDROID_KEYSTORE_PASSWORD" -alias "$ANDROID_KEY_ALIAS" | sed -n 's/^[[:space:]]*SHA256: //p' | tr -d : | tr A-F a-f)
+          [ -n "$want" ] || { echo "no certificate for $ANDROID_KEY_ALIAS in the restored keystore"; exit 1; }
+          apksigner="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/apksigner"
+          for apk in apk-out/*.apk; do
+            got=$("$apksigner" verify --print-certs "$apk" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+            echo "$apk: $got"
+            [ "$got" = "$want" ] || { echo "$apk is not signed with the ANDROID_KEYSTORE_B64 key $want"; exit 1; }
           done
 
       - name: Upload build log
