@@ -12,7 +12,7 @@ on:
 
 jobs:
   split-tunnel:
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       WHISPERA_PORT: "9443"
       SERVER_HOST: "127.0.0.1"

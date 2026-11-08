@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +27,27 @@ var patches = []patch{
 		return E.Cause(err, "platform chown")
 	}`,
 		new: `	_ = filemanager.Chown(c.ctx, c.path) // Android: EPERM is non-fatal`,
+	},
+	{
+		old: `	case *http2.Transport:
+		connPool := transportConnPool(transport)
+		p := (*clientConnPool)((*efaceWords)(unsafe.Pointer(&connPool)).data)
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		for _, vv := range p.conns {
+			for _, cc := range vv {
+				cc.Close()
+			}
+		}
+		return transport`,
+		new: `	case *http2.Transport:
+		transport.CloseIdleConnections()
+		return transport`,
+	},
+	{
+		old: `//go:linkname transportConnPool golang.org/x/net/http2.(*Transport).connPool
+func transportConnPool(t *http2.Transport) http2.ClientConnPool`,
+		new: ``,
 	},
 }
 
@@ -94,22 +116,31 @@ func main() {
 	root := os.Args[1]
 	for _, p := range patches {
 		path := filepath.Join(root, filepath.FromSlash(p.file))
+		label := p.file
+		if p.file == "" {
+			found, err := locate(root, p.old)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "locate patch target: %v\n", err)
+				os.Exit(1)
+			}
+			path, label = found, strings.TrimSpace(strings.SplitN(p.old, "\n", 2)[0])
+		}
 		b, err := os.ReadFile(path)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "read %s: %v\n", path, err)
+			fmt.Fprintf(os.Stderr, "read %s: %v\n", label, err)
 			os.Exit(1)
 		}
 		s := string(b)
 		if !strings.Contains(s, p.old) {
-			fmt.Fprintf(os.Stderr, "patch target not found in %s — version mismatch?\n", p.file)
+			fmt.Fprintf(os.Stderr, "patch target not found for %s — version mismatch?\n", label)
 			os.Exit(1)
 		}
 		s = strings.Replace(s, p.old, p.new, 1)
 		if err := os.WriteFile(path, []byte(s), 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "write %s: %v\n", path, err)
+			fmt.Fprintf(os.Stderr, "write %s: %v\n", label, err)
 			os.Exit(1)
 		}
-		fmt.Printf("patched: %s\n", p.file)
+		fmt.Printf("patched: %s\n", label)
 	}
 	for rel, content := range newFiles {
 		path := filepath.Join(root, filepath.FromSlash(rel))
@@ -119,4 +150,25 @@ func main() {
 		}
 		fmt.Printf("added: %s\n", rel)
 	}
+}
+
+func locate(root, old string) (string, error) {
+	var found []string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") {
+			return err
+		}
+		b, err := os.ReadFile(path)
+		if err == nil && strings.Contains(string(b), old) {
+			found = append(found, path)
+		}
+		return err
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(found) != 1 {
+		return "", fmt.Errorf("%d files hold the patch target", len(found))
+	}
+	return found[0], nil
 }

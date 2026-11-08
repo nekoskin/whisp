@@ -49,7 +49,7 @@ jobs:
               src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
               src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.sig
           - label: macos-universal
-            runner: macos-14
+            runner: macos-15
             triple: universal-apple-darwin
             universal: true
             rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
@@ -257,6 +257,12 @@ jobs:
   build-android:
     name: Build Whisp (Android)
     runs-on: ubuntu-latest
+    env:
+      ANDROID_NDK_VERSION: 27.2.12479018
+      ANDROID_RUST_TARGETS: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      ANDROID_GOMOBILE_TARGETS: android/arm64,android/arm,android/amd64
+      ANDROID_TAURI_TARGETS: aarch64 armv7 x86_64
+      ANDROID_ABIS: arm64-v8a armeabi-v7a x86_64
     steps:
       - uses: actions/checkout@v4
         with:
@@ -288,19 +294,22 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: ''
+          packages: 'ndk;${{ env.ANDROID_NDK_VERSION }}'
+
+      - name: Use the tested NDK
+        run: echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26.x'
+          go-version: '1.27.x'
           cache-dependency-path: |
             go-android/go.sum
 
       - name: Install Rust stable + Android targets
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+          targets: ${{ env.ANDROID_RUST_TARGETS }}
 
       - name: Cache Rust build (Android)
         uses: Swatinem/rust-cache@v2
@@ -377,13 +386,15 @@ jobs:
         env:
           GONOSUMDB: "*"
           GOFLAGS: "-mod=mod"
-          GOTOOLCHAIN: go1.26.4
+          GOTOOLCHAIN: local
         run: |
           export PATH="$PATH:$(go env GOPATH)/bin"
-          MOBILE_VER="v0.0.0-20250813145510-f12310a0cfd9"
+          modver() { (cd go-android && go mod edit -json | jq -r --arg p "$1" '.Require[] | select(.Path == $p) | .Version'); }
+          MOBILE_VER="$(modver golang.org/x/mobile)"
+          SB_VER="$(modver github.com/sagernet/sing-box)"
           for attempt in 1 2 3; do
-            go install golang.org/x/mobile/cmd/gomobile@${MOBILE_VER} \
-              && go install golang.org/x/mobile/cmd/gobind@${MOBILE_VER} && break
+            go install "golang.org/x/mobile/cmd/gomobile@${MOBILE_VER}" \
+              && go install "golang.org/x/mobile/cmd/gobind@${MOBILE_VER}" && break
             echo "module proxy failed (attempt $attempt), retrying"
             sleep 15
           done
@@ -391,16 +402,16 @@ jobs:
           mkdir -p src-tauri/gen/android/app/libs
           cd go-android
           go mod download github.com/sagernet/sing-box || true
-          SB_MOD="$(go env GOPATH)/pkg/mod/github.com/sagernet/sing-box@v1.13.12"
+          SB_MOD="$(go env GOPATH)/pkg/mod/github.com/sagernet/sing-box@${SB_VER}"
           cp -r "$SB_MOD" ./sing-box-patched
           chmod -R u+w ./sing-box-patched
           go run ./cmd/patch ./sing-box-patched
           echo "" >> go.mod
-          echo "replace github.com/sagernet/sing-box v1.13.12 => ./sing-box-patched" >> go.mod
+          echo "replace github.com/sagernet/sing-box ${SB_VER} => ./sing-box-patched" >> go.mod
           go mod tidy
           export NDK_HOME="$ANDROID_NDK_HOME"
           gomobile bind \
-            -target=android/arm64,android/arm,android/amd64,android/386 \
+            -target="$ANDROID_GOMOBILE_TARGETS" \
             -androidapi=21 \
             -tags with_gvisor \
             -ldflags="-checklinkname=0 -s -w" \
@@ -432,14 +443,45 @@ jobs:
         id: tauri_build
         run: |
           export NDK_HOME="$ANDROID_NDK_HOME"
+          read -ra targets <<< "$ANDROID_TAURI_TARGETS"
           set +e
-          npx tauri android build --apk --debug --target aarch64 armv7 x86_64 i686 --verbose > tauri-build.log 2>&1
+          npx tauri android build --apk --debug --target "${targets[@]}" --verbose > tauri-build.log 2>&1
           BUILD_EXIT=$?
           set -e
           echo "exit_code=$BUILD_EXIT" >> $GITHUB_OUTPUT
           exit $BUILD_EXIT
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Keep the universal APK
+        run: |
+          mkdir -p apk-out
+          find src-tauri/gen/android -path "*outputs/apk*" -name "*universal*.apk" -exec cp {} apk-out/ \;
+          ls -l apk-out
+
+      - name: Build Tauri Android APK per ABI (debug, auto-signed)
+        run: |
+          export NDK_HOME="$ANDROID_NDK_HOME"
+          read -ra targets <<< "$ANDROID_TAURI_TARGETS"
+          npx tauri android build --apk --debug --split-per-abi --target "${targets[@]}" --verbose >> tauri-build.log 2>&1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Name per-ABI APKs
+        shell: bash
+        run: |
+          VER=$(jq -r '.version' src-tauri/tauri.conf.json)
+          find src-tauri/gen/android -path "*outputs/apk*" -name "*.apk" ! -name "*universal*" | while read -r apk; do
+            abi=$(unzip -Z1 "$apk" 'lib/*' | cut -d/ -f2 | sort -u | paste -sd, -)
+            case " $ANDROID_ABIS " in
+              *" $abi "*) cp "$apk" "apk-out/Whisp_${VER}_android-${abi}.apk" ;;
+              *) echo "skipping $apk with native libraries for: ${abi:-none}" ;;
+            esac
+          done
+          ls -l apk-out
+          for abi in $ANDROID_ABIS; do
+            test -f "apk-out/Whisp_${VER}_android-${abi}.apk" || { echo "no APK for $abi"; exit 1; }
+          done
 
       - name: Upload build log
         if: always()
@@ -471,7 +513,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: whisp-android-apk
-          path: src-tauri/gen/android/**/*.apk
+          path: apk-out/*.apk
           retention-days: 5
           if-no-files-found: warn
 
