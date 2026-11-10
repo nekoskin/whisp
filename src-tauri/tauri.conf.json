@@ -24,7 +24,7 @@
       "icons/icon.ico"
     ]
   },
-  "productName": "Whisp",
+  "productName": "whisp",
   "mainBinaryName": "Whisp",
   "version": "0.0.14",
   "identifier": "com.whispera.whisp",
